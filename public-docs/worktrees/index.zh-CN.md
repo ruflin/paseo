@@ -101,6 +101,8 @@ paseo workspace create \
 }
 ```
 
+`paseo.json` 也承载项目身份。`{"project": {"key": "my-app"}}` 会把该目录与所有声明了相同 key 的目录归为同一个项目，见[工作区](/docs/workspaces#one-project-across-machines)。身份标记从项目根目录的工作区文件中读取，而不是从 `worktree` 和 `scripts` 所遵循的基础分支读取。
+
 ## Setup 与 teardown {#setup-and-teardown}
 
 插件可以通过 [`worktree.create.after`](/docs/plugins/hooks#worktreecreateafter) 在 setup、终端和第一个 Agent 运行之前写入文件。

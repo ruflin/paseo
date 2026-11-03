@@ -213,4 +213,19 @@ describe("paseo config schema", () => {
       },
     });
   });
+
+  it("keeps the project identity marker through a raw round-trip", () => {
+    const config = { project: { key: "shared-app" }, worktree: { setup: "npm ci" } };
+
+    expect(PaseoConfigRawSchema.parse(config)).toEqual(config);
+  });
+
+  it("does not let a malformed identity marker invalidate the rest of the config", () => {
+    const parsed = PaseoConfigSchema.parse({
+      project: { key: 42 },
+      scripts: { dev: { command: "npm run dev" } },
+    });
+
+    expect(parsed.scripts).toEqual({ dev: { command: "npm run dev" } });
+  });
 });

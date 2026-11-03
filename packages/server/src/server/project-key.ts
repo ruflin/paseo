@@ -9,16 +9,25 @@ export function deriveProjectKey(input: {
   worktreeRoot: string | null;
   mainRepoRoot: string | null;
   serverId?: string;
+  /** Normalized `project.key` marker from `paseo.json`, when the directory declares one. */
+  projectKeyMarker?: string | null;
 }): string {
-  const remote = input.remoteUrl ? parseGitRemoteLocation(input.remoteUrl) : null;
   const selectedPath = input.worktreeRoot
     ? getRealpathAwareRelativePath(input.worktreeRoot, input.rootPath) || null
     : null;
+  const subdirSuffix = selectedPath ? `#subdir:${selectedPath.replaceAll("\\", "/")}` : "";
+  // Explicit directory-declared identity outranks Git and the filesystem: it is
+  // the only way to group a checkout with a copy that has no remote at all.
+  if (input.projectKeyMarker) {
+    return `paseo:${input.projectKeyMarker}${subdirSuffix}`;
+  }
+
+  const remote = input.remoteUrl ? parseGitRemoteLocation(input.remoteUrl) : null;
   if (remote) {
     const host = remote.port ? `${remote.host}:${remote.port}` : remote.host;
     const path = isGitHubHost(remote.host) ? remote.path.toLowerCase() : remote.path;
     const remoteKey = `remote:${host}/${path}`;
-    return selectedPath ? `${remoteKey}#subdir:${selectedPath.replaceAll("\\", "/")}` : remoteKey;
+    return selectedPath ? `${remoteKey}${subdirSuffix}` : remoteKey;
   }
 
   const localPathParts = [
@@ -50,6 +59,20 @@ export function deriveProjectGroupingDisplayName(input: {
 function lastPathSegment(inputPath: string): string {
   const segments = inputPath.split(/[\\/]/u).filter(Boolean);
   return segments[segments.length - 1] ?? inputPath;
+}
+
+// Bounded, path- and separator-safe: a marker never contains `/` or `#`, so it
+// cannot collide with the `remote:` namespace or the `#subdir:` suffix.
+const PROJECT_KEY_MARKER_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+
+/**
+ * The `project.key` marker from `paseo.json` is user-declared identity. Anything
+ * that is not a bounded token is ignored instead of failing the caller.
+ */
+export function normalizeProjectKeyMarker(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return PROJECT_KEY_MARKER_PATTERN.test(trimmed) ? trimmed : null;
 }
 
 function looksLikeWindowsPath(value: string): boolean {

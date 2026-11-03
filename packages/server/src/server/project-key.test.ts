@@ -2,7 +2,11 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "vitest";
-import { deriveProjectGroupingDisplayName, deriveProjectKey } from "./project-key.js";
+import {
+  deriveProjectGroupingDisplayName,
+  deriveProjectKey,
+  normalizeProjectKeyMarker,
+} from "./project-key.js";
 
 describe("deriveProjectKey", () => {
   const rootPath = path.resolve("repo");
@@ -103,6 +107,107 @@ describe("deriveProjectKey", () => {
     expect(deriveSubproject(path.resolve("host-a", "repo"))).toBe(
       deriveSubproject(path.resolve("host-b", "different", "repo")),
     );
+  });
+});
+
+describe("deriveProjectKey with a directory-declared identity marker", () => {
+  test("outranks the Git remote and carries no host", () => {
+    const remoteUrl = "git@github.com:getpaseo/paseo.git";
+    const root = path.resolve("host-a", "repo");
+
+    expect(
+      deriveProjectKey({
+        rootPath: root,
+        remoteUrl,
+        worktreeRoot: root,
+        mainRepoRoot: null,
+        serverId: "host-a",
+        projectKeyMarker: "paseo-app",
+      }),
+    ).toBe("paseo:paseo-app");
+  });
+
+  test("groups a checkout with a copy that has no Git at all", () => {
+    const selected = path.resolve("host-a", "repo");
+    const plainCopy = path.resolve("host-b", "elsewhere", "export");
+
+    const checkoutKey = deriveProjectKey({
+      rootPath: selected,
+      remoteUrl: "git@github.com:getpaseo/paseo.git",
+      worktreeRoot: selected,
+      mainRepoRoot: null,
+      serverId: "host-a",
+      projectKeyMarker: "paseo-app",
+    });
+    const plainCopyKey = deriveProjectKey({
+      rootPath: plainCopy,
+      remoteUrl: null,
+      worktreeRoot: null,
+      mainRepoRoot: null,
+      serverId: "host-b",
+      projectKeyMarker: "paseo-app",
+    });
+
+    expect(checkoutKey).toBe(plainCopyKey);
+  });
+
+  test("keeps a subproject distinct from its repository root", () => {
+    const worktreeRoot = path.resolve("host-a", "repo");
+    const deriveMarkerKey = (rootPath: string) =>
+      deriveProjectKey({
+        rootPath,
+        remoteUrl: "git@github.com:getpaseo/paseo.git",
+        worktreeRoot,
+        mainRepoRoot: null,
+        projectKeyMarker: "paseo-app",
+      });
+
+    expect(deriveMarkerKey(worktreeRoot)).toBe("paseo:paseo-app");
+    expect(deriveMarkerKey(path.join(worktreeRoot, "packages", "app"))).toBe(
+      "paseo:paseo-app#subdir:packages/app",
+    );
+  });
+
+  test("falls back to the remote when the marker is absent", () => {
+    const root = path.resolve("repo");
+
+    expect(
+      deriveProjectKey({
+        rootPath: root,
+        remoteUrl: "git@github.com:getpaseo/paseo.git",
+        worktreeRoot: root,
+        mainRepoRoot: null,
+        projectKeyMarker: null,
+      }),
+    ).toBe("remote:github.com/getpaseo/paseo");
+  });
+});
+
+describe("normalizeProjectKeyMarker", () => {
+  test.each(["app", "team-app_v2", "A.b-c", "x".repeat(128)])("accepts %s", (marker) => {
+    expect(normalizeProjectKeyMarker(marker)).toBe(marker);
+  });
+
+  test("trims surrounding whitespace", () => {
+    expect(normalizeProjectKeyMarker("  app \n")).toBe("app");
+  });
+
+  test.each([
+    "",
+    "   ",
+    "-leading-separator",
+    ".leading-dot",
+    "has space",
+    "slash/inside",
+    "hash#inside",
+    "remote:github.com/foo/bar",
+    "x".repeat(129),
+    42,
+    null,
+    undefined,
+    { key: "app" },
+  ])("rejects %s", (marker) => {
+    expect(normalizeProjectKeyMarker(marker)).toBeNull();
   });
 });
 

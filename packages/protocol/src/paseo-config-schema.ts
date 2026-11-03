@@ -52,6 +52,15 @@ export const PaseoWorktreeConfigRawSchema = z
   })
   .passthrough();
 
+export const PaseoProjectConfigRawSchema = z
+  .object({
+    // Directory-declared project identity. Validated where it is read
+    // (normalizeProjectKeyMarker in the daemon), never here: a malformed marker
+    // must not invalidate the rest of paseo.json.
+    key: z.unknown().optional(),
+  })
+  .passthrough();
+
 export const PaseoMetadataGenerationEntrySchema = z
   .object({
     instructions: z.string().optional(),
@@ -76,6 +85,7 @@ export const PaseoConfigRawSchema = z
     worktree: PaseoWorktreeConfigRawSchema.optional(),
     scripts: z.record(z.string(), PaseoScriptEntryRawSchema).optional(),
     metadataGeneration: PaseoMetadataGenerationSchema.optional(),
+    project: PaseoProjectConfigRawSchema.optional(),
   })
   .passthrough();
 
@@ -92,6 +102,9 @@ export const PaseoConfigSchema = PaseoConfigRawSchema.extend({
   worktree: WorktreeConfigSchema.optional(),
   scripts: z.record(z.string(), ScriptEntrySchema).optional().catch({}),
   metadataGeneration: PaseoMetadataGenerationSchema.optional(),
+  // Tolerant individually: one bad identity marker must not discard the rest of
+  // the config through the top-level catch.
+  project: PaseoProjectConfigRawSchema.optional().catch(undefined),
 })
   .passthrough()
   .catch({});
@@ -112,6 +125,7 @@ export const ProjectConfigRpcErrorSchema = z.discriminatedUnion("code", [
 ]);
 
 export type PaseoScriptEntryRaw = z.infer<typeof PaseoScriptEntryRawSchema>;
+export type PaseoProjectConfigRaw = z.infer<typeof PaseoProjectConfigRawSchema>;
 export type PaseoMetadataGenerationEntry = z.infer<typeof PaseoMetadataGenerationEntrySchema>;
 export type PaseoMetadataGeneration = z.infer<typeof PaseoMetadataGenerationSchema>;
 export type PaseoServicePortAllocation = z.infer<typeof PaseoServicePortAllocationSchema>;

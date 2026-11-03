@@ -18,6 +18,8 @@ import {
 } from "./workspace-registry-model.js";
 import { workspaceIdsForProjects } from "./workspace-directory.js";
 import { deriveProjectKey } from "./project-key.js";
+import { readProjectKeyMarker } from "./project-identity-marker.js";
+import { PASEO_CONFIG_FILE_NAME } from "../utils/paseo-config-file.js";
 
 const DEFAULT_RESCAN_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_DEBOUNCE_MS = 100;
@@ -400,12 +402,14 @@ export class WorkspaceReconciliationService {
     if (!project || project.archivedAt || project.rootPath !== input.project.rootPath) return;
     const projectUpdates: Partial<Pick<PersistedProjectRecord, "kind" | "projectKey">> = {};
     const mappedKind = deriveProjectKind(currentGit);
+    const projectKeyMarker = await readProjectKeyMarker(project.rootPath);
     const projectKey = deriveProjectKey({
       rootPath: project.rootPath,
       remoteUrl: currentGit.remoteUrl,
       worktreeRoot: currentGit.worktreeRoot,
       mainRepoRoot: currentGit.mainRepoRoot,
       serverId: this.serverId,
+      projectKeyMarker,
     });
 
     if (project.kind !== mappedKind) {
@@ -490,7 +494,8 @@ export class WorkspaceReconciliationService {
           project.rootPath,
           { recursive: false },
           (_event, filename) => {
-            if (filename === null || filename.toString() === ".git") {
+            const changed = filename === null ? null : filename.toString();
+            if (changed === null || changed === ".git" || changed === PASEO_CONFIG_FILE_NAME) {
               this.scheduleObservedReconciliation();
             }
           },

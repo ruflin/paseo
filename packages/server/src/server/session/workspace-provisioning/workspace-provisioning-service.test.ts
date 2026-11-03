@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 
 import { afterEach, beforeEach, expect, test } from "vitest";
 
@@ -142,6 +142,27 @@ test("fresh non-git directory creates a directory workspace at the exact path", 
   const workspace = await provisioning.findOrCreateWorkspaceForDirectory(dir);
 
   expect(workspace.cwd).toBe(dir);
+});
+
+test("a directory-declared identity marker makes a checkout and a plain directory one project", async () => {
+  const checkout = path.join(tmpDir, "checkout");
+  const plain = path.join(tmpDir, "plain");
+  mkdirSync(checkout, { recursive: true });
+  mkdirSync(plain, { recursive: true });
+  for (const dir of [checkout, plain]) {
+    writeFileSync(path.join(dir, "paseo.json"), JSON.stringify({ project: { key: "shared-app" } }));
+  }
+  gitRoots.add(checkout);
+
+  const first = await provisioning.findOrCreateWorkspaceForDirectory(checkout);
+  const second = await provisioning.findOrCreateWorkspaceForDirectory(plain);
+
+  // Two host-local projects, one cross-host identity: grouping happens in the app.
+  expect(first.projectId).not.toBe(second.projectId);
+  expect((await projectRegistry.list()).map((project) => project.projectKey)).toEqual([
+    "paseo:shared-app",
+    "paseo:shared-app",
+  ]);
 });
 
 test("background workspace creation preserves hooks, inheritance and durable visibility", async () => {

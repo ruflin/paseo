@@ -18,6 +18,7 @@ import {
 import type { WorkspaceGitService } from "../../workspace-git-service.js";
 import type { CreatePaseoWorktreeWorkflowResult } from "../../worktree-session.js";
 import { deriveProjectKey } from "../../project-key.js";
+import { readProjectKeyMarker } from "../../project-identity-marker.js";
 import { areEquivalentPaths, createRealpathAwarePathMatcher } from "../../../utils/path.js";
 import type { UntrustedWorkspaceSource } from "../../workspace-automation-gate.js";
 
@@ -212,6 +213,7 @@ export function createWorkspaceProvisioningService(deps: {
         worktreeRoot: checkout.worktreeRoot,
         mainRepoRoot: checkout.mainRepoRoot,
         serverId,
+        projectKeyMarker: await readProjectKeyMarker(rootPath),
       }),
       timestamp,
     });
@@ -347,6 +349,7 @@ export function createWorkspaceProvisioningService(deps: {
         worktreeRoot: checkout.worktreeRoot,
         mainRepoRoot: checkout.mainRepoRoot,
         serverId,
+        projectKeyMarker: await readProjectKeyMarker(input.repoRoot),
       }),
       timestamp: new Date().toISOString(),
     });
@@ -443,6 +446,7 @@ export function createWorkspaceProvisioningService(deps: {
         worktreeRoot: projectCheckout.worktreeRoot,
         mainRepoRoot: projectCheckout.mainRepoRoot,
         serverId,
+        projectKeyMarker: await readProjectKeyMarker(project.rootPath),
       });
       if (project.archivedAt || project.kind !== kind || project.projectKey !== projectKey) {
         await projectRegistry.upsert({
@@ -493,6 +497,7 @@ export function createWorkspaceProvisioningService(deps: {
       worktreeRoot: projectCheckout.worktreeRoot,
       mainRepoRoot: projectCheckout.mainRepoRoot,
       serverId,
+      projectKeyMarker: await readProjectKeyMarker(project.rootPath),
     });
     if (project.kind === kind && project.projectKey === projectKey) return project;
     const refreshed = {

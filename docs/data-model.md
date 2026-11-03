@@ -5,10 +5,17 @@
 Projects are allocated for the exact root selected by the caller, normalized lexically with `path.resolve` (never `realpath`). New project IDs are opaque `prj_<16 hex>` values. Existing remote-shaped or path-shaped IDs are retained as readable compatibility records and are never rekeyed. An active exact root is idempotent; archived-only matches do not resurrect an old project. Workspace `projectId` is stable membership: reconciliation may update git-derived kind and branch metadata, but never rehomes a workspace or changes a project's root, ID, or default name.
 
 `projectKey` is a persisted, opaque equivalence key used only to group the same logical project
-across hosts. It is separate from the host-local `projectId`; today's producer prefers a normalized
-Git remote and otherwise uses the local project root. Consumers never derive it from live Git.
+across hosts. It is separate from the host-local `projectId`; the producer prefers an explicit
+directory-declared identity, then a normalized Git remote, and otherwise uses the local project root.
+Consumers never derive it from live Git.
 Creation persists it with the project, and normal boot reconciliation fills it for
 older records where the field is absent—there is no migration.
+
+The explicit identity is the `project.key` marker in `paseo.json` at the exact project root
+(`{"project": {"key": "my-app"}}`), read from the working tree only. It becomes `paseo:<key>`, keeps
+the `#subdir:` suffix for a root inside a worktree, carries no host component, and is ignored when it
+is not a bounded token of letters, digits, `.`, `_` and `-`. That marker is the only way for a
+checkout to group with a copy that has no Git remote at all, and it outranks the remote.
 
 `kind` and `projectKey` are mutable metadata, not identity. Workspace reconciliation watches active project roots and
 updates those fields and `updatedAt` when Git facts change, preserving the project's ID, root path,
