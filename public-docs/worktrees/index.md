@@ -103,6 +103,8 @@ Drop a `paseo.json` in your repo root. Paseo reads it from the committed version
 }
 ```
 
+`paseo.json` also carries the project identity. `{"project": {"key": "my-app"}}` groups the directory with every other directory that declares the same key; see [Workspaces](/docs/workspaces#one-project-across-machines). The identity marker is read from the working tree at the project root, not from the base branch that `worktree` and `scripts` follow.
+
 ## Setup and teardown
 
 Plugins can use [`worktree.create.after`](/docs/plugins/hooks#worktreecreateafter) to write files before setup, terminals, and the first agent.

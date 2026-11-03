@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { ProjectCheckoutLitePayload } from "@getpaseo/protocol/messages";
@@ -12,6 +12,7 @@ import {
   createPersistedWorkspaceRecord,
   FileBackedProjectRegistry,
   FileBackedWorkspaceRegistry,
+  type PersistedProjectRecord,
   type PersistedWorkspaceRecord,
 } from "./workspace-registry.js";
 import {
@@ -298,6 +299,20 @@ class ObservedPlacements {
     return this.workspaces.get(workspaceId);
   }
 
+  async projectRecord(projectId: string): Promise<PersistedProjectRecord | null> {
+    return this.projects.get(projectId);
+  }
+
+  writeMarker(root: string, key: unknown): void {
+    const rootPath = this.absolute(root);
+    mkdirSync(rootPath, { recursive: true });
+    writeFileSync(path.join(rootPath, "paseo.json"), JSON.stringify({ project: { key } }));
+  }
+
+  removeMarker(root: string): void {
+    rmSync(path.join(this.absolute(root), "paseo.json"), { force: true });
+  }
+
   async deleteWorkspaceDirectory(workspaceId: string): Promise<void> {
     const workspace = await this.workspaces.get(workspaceId);
     if (!workspace) throw new Error(`Unknown workspace: ${workspaceId}`);
@@ -459,6 +474,53 @@ describe("observed workspace placement", () => {
     observed.change("repo", null);
     await observed.advanceBy(DEBOUNCE_MS);
     expect(observed.gitReads).toBe(1);
+    observed.dispose();
+  });
+
+  test("applies a directory-declared identity marker published through paseo.json", async () => {
+    const observed = new ObservedPlacements([{ id: "project-one", root: "repo" }]);
+    await observed.start();
+    expect((await observed.projectRecord("project-one"))?.projectKey).not.toBe("paseo:shared-app");
+
+    observed.writeMarker("repo", "shared-app");
+    observed.change("repo", "paseo.json");
+    await observed.advanceBy(DEBOUNCE_MS);
+
+    expect((await observed.projectRecord("project-one"))?.projectKey).toBe("paseo:shared-app");
+    expect(observed.projectUpdates).toEqual([
+      { kind: "upsert", project: expect.objectContaining({ projectId: "project-one" }) },
+    ]);
+    observed.dispose();
+  });
+
+  test("reverts to the derived key when the directory drops its marker", async () => {
+    const observed = new ObservedPlacements([{ id: "project-one", root: "repo" }]);
+    await observed.start();
+
+    observed.writeMarker("repo", "shared-app");
+    observed.change("repo", "paseo.json");
+    await observed.advanceBy(DEBOUNCE_MS);
+    expect((await observed.projectRecord("project-one"))?.projectKey).toBe("paseo:shared-app");
+
+    observed.removeMarker("repo");
+    observed.change("repo", "paseo.json");
+    await observed.advanceBy(DEBOUNCE_MS);
+
+    expect((await observed.projectRecord("project-one"))?.projectKey).not.toBe("paseo:shared-app");
+    observed.dispose();
+  });
+
+  test("ignores a malformed identity marker and keeps the derived key", async () => {
+    const observed = new ObservedPlacements([{ id: "project-one", root: "repo" }]);
+    await observed.start();
+    const initialKey = (await observed.projectRecord("project-one"))?.projectKey;
+
+    observed.writeMarker("repo", "has space");
+    observed.change("repo", "paseo.json");
+    await observed.advanceBy(DEBOUNCE_MS);
+
+    expect((await observed.projectRecord("project-one"))?.projectKey).toBe(initialKey);
+    expect(observed.projectUpdates).toEqual([]);
     observed.dispose();
   });
 

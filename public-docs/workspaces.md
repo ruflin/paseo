@@ -29,6 +29,22 @@ Each workspace is a separate place to work. You can keep one for your main check
 
 Use the [CLI project commands](/docs/cli#projects) to register, list, rename, or delete projects.
 
+### One project across machines
+
+Paseo groups directories that share a project identity. By default that identity is the git remote, so the same repository on two machines is one project in the sidebar.
+
+A directory that is not a git checkout can declare its own identity in `paseo.json` at the project root:
+
+```json
+{
+  "project": {
+    "key": "my-app"
+  }
+}
+```
+
+Every directory that declares the same `key` belongs to the same project, on one machine or many. The marker outranks the git remote. Only the exact project root is read, so subfolders do not inherit it, and anything that is not a short token of letters, digits, `.`, `_` and `-` is ignored. Commit the file when the repositories should keep the identity on every checkout.
+
 ## Workspaces contain sessions
 
 Agents run inside a workspace as sessions. A workspace can have one agent session, several agent sessions, terminals, browsers, and diffs open at the same time.

@@ -574,7 +574,9 @@ describe("WorkspaceReconciliationService", () => {
         workerMessages: number;
       };
       expect(blockingMs).toBeLessThan(20);
-      expect(filesystemRequests).toBe(20001);
+      // 20000 workspace stats + one project-root stat + one paseo.json stat for the
+      // directory-declared identity marker. The budget stays per workspace.
+      expect(filesystemRequests).toBe(20002);
       expect(changesApplied).toBe(20000);
       expect(allArchived).toBe(true);
       expect(yields).toBeGreaterThan(0);
