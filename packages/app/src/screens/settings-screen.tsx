@@ -57,6 +57,7 @@ import { OpenLocationSection } from "@/screens/settings/open-location/open-locat
 import { TerminalSection } from "@/screens/settings/terminal/terminal-section";
 import { ChatSection } from "@/screens/settings/chat/chat-section";
 import { SidebarNavSection } from "@/screens/settings/sidebar/sidebar-nav-section";
+import { AgentDefaultsSection } from "@/screens/settings/general/agent-defaults-section";
 import { SendingSection } from "@/screens/settings/general/sending-section";
 import {
   useAppSettings,
@@ -1323,6 +1324,7 @@ export default function SettingsScreen({ view }: SettingsScreenProps) {
             <>
               <GeneralSection settings={settings} handleLanguageChange={handleLanguageChange} />
               <SendingSection />
+              <AgentDefaultsSection />
               {isDesktopApp ? <OpenLocationSection /> : null}
             </>
           );

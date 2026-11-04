@@ -14,6 +14,11 @@ import {
 import { filterSelectableModels } from "@/provider-selection/model-catalog";
 import { OptimisticFormPreferences } from "@/create-agent-preferences/optimistic-preferences";
 import { applyAgentProfilePreferences } from "@/create-agent-preferences/preferences";
+import {
+  resolveProjectPreferences,
+  scopePreferenceUpdate,
+} from "@/create-agent-preferences/project-preferences";
+import { useProjectPreferenceKey } from "./use-project-form-preferences";
 import { useProvidersSnapshot } from "./use-providers-snapshot";
 import {
   useFormPreferences,
@@ -148,20 +153,35 @@ async function persistProviderPreferences(input: {
 export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFormStateResult {
   const { serverId, initialValues, workingDir, isVisible = true, isCreateFlow = true } = options;
 
-  const { preferences, isLoading: isPreferencesLoading, updatePreferences } = useFormPreferences();
-  const preferenceOverlayRef = useRef(new OptimisticFormPreferences(preferences));
+  const {
+    preferences: storedPreferences,
+    isLoading: isPreferencesLoading,
+    updatePreferences,
+  } = useFormPreferences();
+  const projectPreferenceKey = useProjectPreferenceKey(serverId, workingDir);
+  const preferences = useMemo(
+    () => resolveProjectPreferences(storedPreferences, projectPreferenceKey),
+    [storedPreferences, projectPreferenceKey],
+  );
+  const preferenceOverlayRef = useRef(new OptimisticFormPreferences(storedPreferences));
 
   useEffect(() => {
-    preferenceOverlayRef.current.reconcile(preferences);
-  }, [preferences]);
+    preferenceOverlayRef.current.reconcile(storedPreferences);
+  }, [storedPreferences]);
+
+  const readCurrentPreferences = useCallback(
+    () => resolveProjectPreferences(preferenceOverlayRef.current.current(), projectPreferenceKey),
+    [projectPreferenceKey],
+  );
 
   const updateCurrentPreferences = useCallback(
     async (
       updates: Partial<FormPreferences> | ((current: FormPreferences) => FormPreferences),
     ): Promise<FormPreferences> => {
-      const pendingId = preferenceOverlayRef.current.begin(updates);
+      const scopedUpdates = scopePreferenceUpdate(updates, projectPreferenceKey);
+      const pendingId = preferenceOverlayRef.current.begin(scopedUpdates);
       try {
-        const persisted = await updatePreferences(updates);
+        const persisted = await updatePreferences(scopedUpdates);
         preferenceOverlayRef.current.commit(pendingId, persisted);
         return persisted;
       } catch (error) {
@@ -169,7 +189,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
         throw error;
       }
     },
-    [updatePreferences],
+    [projectPreferenceKey, updatePreferences],
   );
 
   const [{ form: formState, userModified, resolution }, dispatch] = useReducer(resolveAgentForm, {
@@ -286,7 +306,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
       }
       const providerDef = selectableProviderDefinitionMap.get(provider);
       const providerModels = allProviderModels.get(provider) ?? null;
-      const providerPrefs = preferenceOverlayRef.current.current().providerPreferences?.[provider];
+      const providerPrefs = readCurrentPreferences().providerPreferences?.[provider];
       const normalizedModelId = normalizeSelectedModelId(modelId);
       const nextModelId = normalizedModelId || resolveDefaultModelId(providerModels);
 
@@ -308,7 +328,12 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
         }),
       );
     },
-    [allProviderModels, selectableProviderDefinitionMap, updateCurrentPreferences],
+    [
+      allProviderModels,
+      readCurrentPreferences,
+      selectableProviderDefinitionMap,
+      updateCurrentPreferences,
+    ],
   );
 
   const clearProviderSelectionFromUser = useCallback(() => {
@@ -325,7 +350,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
       const previousProvider = formState.provider;
       const providerDef = selectableProviderDefinitionMap.get(provider);
       const providerModels = allProviderModels.get(provider) ?? null;
-      const providerPrefs = preferenceOverlayRef.current.current().providerPreferences?.[provider];
+      const providerPrefs = readCurrentPreferences().providerPreferences?.[provider];
       const action = {
         type: "APPLY_PROFILE_FROM_USER" as const,
         provider,
@@ -362,6 +387,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
       allProviderModels,
       formState,
       providerDefinitionMap,
+      readCurrentPreferences,
       resolution,
       selectableProviderDefinitionMap,
       updateCurrentPreferences,
@@ -392,7 +418,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
     (modelId: string) => {
       const provider = formState.provider;
       const providerPrefs = provider
-        ? preferenceOverlayRef.current.current().providerPreferences?.[provider]
+        ? readCurrentPreferences().providerPreferences?.[provider]
         : undefined;
       dispatch({
         type: "SET_MODEL_FROM_USER",
@@ -414,7 +440,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
         );
       }
     },
-    [availableModels, formState.provider, updateCurrentPreferences],
+    [availableModels, formState.provider, readCurrentPreferences, updateCurrentPreferences],
   );
 
   const setThinkingOptionFromUser = useCallback(

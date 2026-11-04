@@ -2403,6 +2403,12 @@ export const ja: TranslationResources = {
     general: {
       title: "一般",
       sending: "送信",
+      agentDefaults: "新しいエージェント",
+      rememberModelPerProject: {
+        label: "プロジェクトごとにモデルを記憶",
+        description:
+          "プロジェクト内の新しいエージェントを、そのプロジェクトで最後に使ったプロバイダー、モデル、モードで開始します",
+      },
       setup: {
         label: "初回セットアップ",
         description:

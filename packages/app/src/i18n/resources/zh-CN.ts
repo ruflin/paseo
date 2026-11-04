@@ -2356,6 +2356,11 @@ export const zhCN: TranslationResources = {
     general: {
       title: "通用",
       sending: "发送",
+      agentDefaults: "新 Agent",
+      rememberModelPerProject: {
+        label: "按项目记住模型",
+        description: "在项目中新建 Agent 时，使用你上次在该项目中用过的 provider、模型和模式",
+      },
       setup: {
         label: "首次设置",
         description: "重新设置外观、提供方、项目和手机配对",

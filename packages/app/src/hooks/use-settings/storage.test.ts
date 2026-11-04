@@ -260,6 +260,38 @@ describe("loadAppSettingsFromStorage", () => {
     expect(result.sendShortcut).toBe("enter");
   });
 
+  it("keeps one model for every project until remembering per project is turned on", async () => {
+    const deps = makeDeps();
+
+    const result = await loadAppSettingsFromStorage(deps);
+
+    expect(result.rememberModelPerProject).toBe(false);
+  });
+
+  it("loads the remember model per project preference", async () => {
+    const deps = makeDeps({
+      storage: createInMemoryKeyValueStorage({
+        [APP_SETTINGS_KEY]: JSON.stringify({ rememberModelPerProject: true }),
+      }),
+    });
+
+    const result = await loadAppSettingsFromStorage(deps);
+
+    expect(result.rememberModelPerProject).toBe(true);
+  });
+
+  it("turns remembering per project off when the stored value is malformed", async () => {
+    const deps = makeDeps({
+      storage: createInMemoryKeyValueStorage({
+        [APP_SETTINGS_KEY]: JSON.stringify({ rememberModelPerProject: "yes" }),
+      }),
+    });
+
+    const result = await loadAppSettingsFromStorage(deps);
+
+    expect(result.rememberModelPerProject).toBe(false);
+  });
+
   it("defaults sidebar navigation items to an empty preference list", async () => {
     const deps = makeDeps();
 

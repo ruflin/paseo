@@ -7,6 +7,7 @@ import {
   createWorkspaceStructureProjectsSelector,
   selectHasHydratedWorkspaces,
   selectHydratedWorkspaceServerIds,
+  createProjectIdentityForDirectorySelector,
   selectWorkspaceDirectoryServerIds,
   selectHasWorkspaces,
   selectProjectOrder,
@@ -19,6 +20,7 @@ import {
   selectWorkspaceKeys,
   selectWorkspaceStatusesForBadges,
   workspaceEqualityFns,
+  type ProjectIdentity,
   type WorkspaceStructure,
 } from "./selectors";
 import { useSessionStore, type WorkspaceDescriptor } from "../session-store";
@@ -55,6 +57,17 @@ export function useWorkspaceFields<T>(
     (state) => selectWorkspaceFields(state, serverId, workspaceId, project),
     workspaceEqualityFns.deep,
   );
+}
+
+export function useProjectIdentityForDirectory(
+  serverId: string | null,
+  directory: string | null,
+): ProjectIdentity | null {
+  const selectIdentity = useMemo(
+    () => createProjectIdentityForDirectorySelector(serverId, directory),
+    [directory, serverId],
+  );
+  return useStoreWithEqualityFn(useSessionStore, selectIdentity, workspaceEqualityFns.deep);
 }
 
 export function useWorkspaceExists(serverId: string | null, workspaceId: string | null): boolean {

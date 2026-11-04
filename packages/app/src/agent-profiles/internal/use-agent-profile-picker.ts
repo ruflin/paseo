@@ -1,7 +1,7 @@
 import { useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import { mergeCreateAgentSelectionPreferences } from "@/create-agent-preferences/preferences";
-import { useFormPreferences } from "@/hooks/use-form-preferences";
+import { useAgentProjectFormPreferences } from "@/hooks/use-project-form-preferences";
 import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
 import { useSessionStore } from "@/stores/session-store";
 import { useToast } from "@/contexts/toast-context";
@@ -72,7 +72,10 @@ export function useAgentProfilePicker(
   // rather than a workspace's. That is also the key the settings section uses,
   // so every composer on a host shares one query instead of adding its own.
   const { entries } = useProvidersSnapshot(serverId, { cwd: null });
-  const { updatePreferences } = useFormPreferences();
+  const { updatePreferences } = useAgentProjectFormPreferences({
+    serverId,
+    agentId: target.kind === "agent" ? target.agentId : null,
+  });
   const client = useSessionStore((state) => state.sessions[serverId ?? ""]?.client ?? null);
   const toast = useToast();
 

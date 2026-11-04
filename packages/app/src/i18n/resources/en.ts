@@ -2506,6 +2506,12 @@ export const en = {
     general: {
       title: "General",
       sending: "Sending",
+      agentDefaults: "New agents",
+      rememberModelPerProject: {
+        label: "Remember model per project",
+        description:
+          "Start new agents in a project with the provider, model and mode you last used there",
+      },
       setup: {
         label: "First-run setup",
         description: "Walk through appearance, providers, projects and phone pairing again",

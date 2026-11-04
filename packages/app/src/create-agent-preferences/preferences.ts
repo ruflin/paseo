@@ -12,9 +12,17 @@ export interface ProviderPreferences {
 
 export type LaunchTarget = { kind: "chat" } | { kind: "terminal"; profileId: string };
 
+/** What the create flow remembers inside one project; the same fields it remembers globally. */
+export interface ProjectSelectionPreferences {
+  provider?: string;
+  providerPreferences?: Record<string, ProviderPreferences>;
+}
+
 export interface FormPreferences {
   provider?: string;
   providerPreferences?: Record<string, ProviderPreferences>;
+  /** Keyed by `buildProjectPreferenceKey`. Only read and written while remembering per project. */
+  projectPreferences?: Record<string, ProjectSelectionPreferences>;
   favoriteModels?: Array<{ provider: string; modelId: string }>;
   isolation?: "local" | "worktree";
   launchTarget?: LaunchTarget;
@@ -27,6 +35,11 @@ const providerPreferencesSchema: z.ZodType<ProviderPreferences> = z.strictObject
   featureValues: featureValuesSchema.optional(),
 });
 
+const projectSelectionPreferencesSchema: z.ZodType<ProjectSelectionPreferences> = z.strictObject({
+  provider: z.string().optional(),
+  providerPreferences: z.record(z.string(), providerPreferencesSchema).optional(),
+});
+
 const launchTargetSchema: z.ZodType<LaunchTarget> = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("chat") }),
   z.strictObject({ kind: z.literal("terminal"), profileId: z.string() }),
@@ -35,6 +48,7 @@ const launchTargetSchema: z.ZodType<LaunchTarget> = z.discriminatedUnion("kind",
 export const FormPreferencesSchema = z.strictObject({
   provider: z.string().optional(),
   providerPreferences: z.record(z.string(), providerPreferencesSchema).optional(),
+  projectPreferences: z.record(z.string(), projectSelectionPreferencesSchema).optional(),
   // COMPAT(agentProfileFavoriteMigration): favourites were removed in v0.3.2.
   // Keep the legacy payload alive until every capable host has had a chance to
   // import it; ordinary preference writes must not erase it first.
@@ -110,7 +124,7 @@ function mergeDefinedRecord<T>(
   };
 }
 
-function applyProviderPreferenceUpdates(
+export function applyProviderPreferenceUpdates(
   existing: ProviderPreferences,
   updates: Omit<Partial<ProviderPreferences>, "mode"> & { mode?: string | null },
 ): ProviderPreferences {

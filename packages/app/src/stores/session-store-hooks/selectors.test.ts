@@ -8,6 +8,8 @@ import {
   selectHasWorkspaces,
   selectHydratedWorkspaceServerIds,
   selectWorkspaceDirectoryServerIds,
+  createProjectIdentityForDirectorySelector,
+  selectProjectIdentityForDirectory,
   selectProjectOrder,
   selectRecommendedProjectPaths,
   selectWorkspace,
@@ -50,6 +52,7 @@ function createWorkspace(
     statusEnteredAt: null,
     diffStat: input.diffStat ?? null,
     scripts: input.scripts ?? [],
+    ...(input.project ? { project: input.project } : {}),
   };
 }
 
@@ -305,6 +308,100 @@ describe("selectWorkspaceDirectory", () => {
     expect(
       selectWorkspaceDirectory(useSessionStore.getState(), SERVER_ID, "missing-id"),
     ).toBeNull();
+  });
+});
+
+describe("selectProjectIdentityForDirectory", () => {
+  function placement(projectKey: string): NonNullable<WorkspaceDescriptor["project"]> {
+    return {
+      projectKey,
+      projectName: "web",
+      checkout: {
+        cwd: "/dev/web",
+        isGit: false,
+        currentBranch: null,
+        remoteUrl: null,
+        worktreeRoot: null,
+        isPaseoOwnedWorktree: false,
+        mainRepoRoot: null,
+      },
+    };
+  }
+  const checkout = createWorkspace({
+    id: "wks_checkout",
+    projectId: "prj_web",
+    projectRootPath: "/dev/web",
+    workspaceDirectory: "/dev/web",
+    project: placement("github.com/acme/web"),
+  });
+  const worktree = createWorkspace({
+    id: "wks_worktree",
+    projectId: "prj_web",
+    projectRootPath: "/dev/web",
+    workspaceDirectory: "/dev/web-feature",
+    workspaceKind: "worktree",
+    project: placement("github.com/acme/web"),
+  });
+  const rootOnly = createWorkspace({
+    id: "wks_other",
+    projectId: "prj_api",
+    projectRootPath: "/dev/api",
+    workspaceDirectory: "/dev/api-feature",
+    workspaceKind: "worktree",
+  });
+
+  it("puts a worktree in the same project as its checkout", () => {
+    initializeWorkspaces([checkout, worktree]);
+    const state = useSessionStore.getState();
+
+    const fromWorktree = selectProjectIdentityForDirectory(state, SERVER_ID, "/dev/web-feature");
+    const fromCheckout = selectProjectIdentityForDirectory(state, SERVER_ID, "/dev/web");
+
+    expect(fromWorktree).toEqual({ projectId: "prj_web", projectKey: "github.com/acme/web" });
+    expect(fromCheckout).toEqual(fromWorktree);
+  });
+
+  it("finds the project of a draft that points at the project root with no workspace there", () => {
+    initializeWorkspaces([rootOnly]);
+
+    expect(
+      selectProjectIdentityForDirectory(useSessionStore.getState(), SERVER_ID, "/dev/api"),
+    ).toEqual({ projectId: "prj_api", projectKey: null });
+  });
+
+  it("keeps the same result while the host's workspaces are unchanged", () => {
+    initializeWorkspaces([checkout]);
+    const select = createProjectIdentityForDirectorySelector(SERVER_ID, "/dev/web");
+
+    const first = select(useSessionStore.getState());
+    useSessionStore.getState().setHasHydratedWorkspaces(SERVER_ID, true);
+    const afterUnrelatedUpdate = select(useSessionStore.getState());
+
+    expect(first).toEqual({ projectId: "prj_web", projectKey: "github.com/acme/web" });
+    expect(afterUnrelatedUpdate).toBe(first);
+  });
+
+  it("follows the workspace when the host's workspaces change", () => {
+    initializeWorkspaces([checkout]);
+    const select = createProjectIdentityForDirectorySelector(SERVER_ID, "/dev/web");
+    select(useSessionStore.getState());
+
+    initializeWorkspaces([{ ...checkout, project: placement("github.com/acme/web-renamed") }]);
+
+    expect(select(useSessionStore.getState())).toEqual({
+      projectId: "prj_web",
+      projectKey: "github.com/acme/web-renamed",
+    });
+  });
+
+  it("returns null for an unknown directory, an unknown host, or no directory", () => {
+    initializeWorkspaces([checkout]);
+    const state = useSessionStore.getState();
+
+    expect(selectProjectIdentityForDirectory(state, SERVER_ID, "/elsewhere")).toBeNull();
+    expect(selectProjectIdentityForDirectory(state, "other-host", "/dev/web")).toBeNull();
+    expect(selectProjectIdentityForDirectory(state, SERVER_ID, null)).toBeNull();
+    expect(selectProjectIdentityForDirectory(state, null, "/dev/web")).toBeNull();
   });
 });
 
