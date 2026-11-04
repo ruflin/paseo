@@ -2416,6 +2416,11 @@ export const ar: TranslationResources = {
     general: {
       title: "عام",
       sending: "الإرسال",
+      agentDefaults: "الوكلاء الجدد",
+      rememberModelPerProject: {
+        label: "تذكّر النموذج لكل مشروع",
+        description: "ابدأ الوكلاء الجدد في كل مشروع بآخر مزود ونموذج ووضع استخدمتها فيه",
+      },
       setup: {
         label: "الإعداد الأولي",
         description: "أعد المرور على المظهر والمزوّدين والمشاريع وإقران الهاتف",

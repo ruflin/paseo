@@ -2429,6 +2429,12 @@ export const es: TranslationResources = {
     general: {
       title: "General",
       sending: "Envío",
+      agentDefaults: "Agentes nuevos",
+      rememberModelPerProject: {
+        label: "Recordar el modelo por proyecto",
+        description:
+          "Inicia los agentes nuevos de un proyecto con el proveedor, el modelo y el modo que usaste por última vez en él",
+      },
       setup: {
         label: "Configuración inicial",
         description:

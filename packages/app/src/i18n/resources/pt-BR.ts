@@ -2414,6 +2414,12 @@ export const ptBR: TranslationResources = {
     general: {
       title: "Geral",
       sending: "Envio",
+      agentDefaults: "Novos agentes",
+      rememberModelPerProject: {
+        label: "Lembrar o modelo por projeto",
+        description:
+          "Inicia novos agentes em um projeto com o provedor, o modelo e o modo usados por último nele",
+      },
       setup: {
         label: "Configuração inicial",
         description: "Rever aparência, provedores, projetos e pareamento do celular",

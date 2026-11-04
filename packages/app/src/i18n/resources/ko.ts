@@ -2391,6 +2391,12 @@ export const ko: TranslationResources = {
     general: {
       title: "일반",
       sending: "전송",
+      agentDefaults: "새 에이전트",
+      rememberModelPerProject: {
+        label: "프로젝트별로 모델 기억",
+        description:
+          "프로젝트의 새 에이전트를 그 프로젝트에서 마지막으로 사용한 프로바이더, 모델, 모드로 시작합니다",
+      },
       setup: {
         label: "초기 설정",
         description: "모양, 제공자, 프로젝트, 휴대폰 페어링을 다시 진행합니다",

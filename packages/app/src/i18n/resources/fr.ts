@@ -2430,6 +2430,12 @@ export const fr: TranslationResources = {
     general: {
       title: "Général",
       sending: "Envoi",
+      agentDefaults: "Nouveaux agents",
+      rememberModelPerProject: {
+        label: "Mémoriser le modèle par projet",
+        description:
+          "Démarre les nouveaux agents d’un projet avec le fournisseur, le modèle et le mode utilisés en dernier dans ce projet",
+      },
       setup: {
         label: "Configuration initiale",
         description:

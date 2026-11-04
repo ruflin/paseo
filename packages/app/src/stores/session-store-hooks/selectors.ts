@@ -117,6 +117,59 @@ export function selectWorkspaceDirectory(
   return selectWorkspace(state, serverId, workspaceId)?.workspaceDirectory || null;
 }
 
+export interface ProjectIdentity {
+  projectId: string;
+  projectKey: string | null;
+}
+
+/**
+ * The project that owns a directory on one host: a workspace's own directory first, then a
+ * project root, which is what a draft with no workspace yet points at.
+ */
+export function selectProjectIdentityForDirectory(
+  state: SessionsSnapshot,
+  serverId: string | null,
+  directory: string | null,
+): ProjectIdentity | null {
+  const workspaces = serverId && directory ? state.sessions[serverId]?.workspaces : undefined;
+  if (!workspaces) {
+    return null;
+  }
+  let rootMatch: WorkspaceDescriptor | null = null;
+  for (const workspace of workspaces.values()) {
+    if (workspace.workspaceDirectory === directory) {
+      return { projectId: workspace.projectId, projectKey: workspace.project?.projectKey ?? null };
+    }
+    if (rootMatch === null && workspace.projectRootPath === directory) {
+      rootMatch = workspace;
+    }
+  }
+  return rootMatch
+    ? { projectId: rootMatch.projectId, projectKey: rootMatch.project?.projectKey ?? null }
+    : null;
+}
+
+/** `selectProjectIdentityForDirectory` for a store subscription: it rescans only when the host's workspaces change. */
+export function createProjectIdentityForDirectorySelector(
+  serverId: string | null,
+  directory: string | null,
+): (state: SessionsSnapshot) => ProjectIdentity | null {
+  let hasRun = false;
+  let previousWorkspaces: Map<string, WorkspaceDescriptor> | undefined;
+  let previousIdentity: ProjectIdentity | null = null;
+
+  return (state) => {
+    const workspaces = serverId ? state.sessions[serverId]?.workspaces : undefined;
+    if (hasRun && workspaces === previousWorkspaces) {
+      return previousIdentity;
+    }
+    hasRun = true;
+    previousWorkspaces = workspaces;
+    previousIdentity = selectProjectIdentityForDirectory(state, serverId, directory);
+    return previousIdentity;
+  };
+}
+
 export function selectWorkspaceExists(
   state: SessionsSnapshot,
   serverId: string | null,
