@@ -4,8 +4,11 @@ import type {
   ProviderCommand,
   ProviderConfigState,
   ProviderNotice,
+  ProviderPersistence,
   ProviderRegistration,
+  ProviderSessionConfig,
   ProviderTimelineItem,
+  ProviderToolCallDetail,
 } from "./provider.js";
 import { createAcpProviderConnection } from "./acp-internal/connection.js";
 
@@ -48,6 +51,10 @@ export interface AcpOptions {
   workspaceOnlyCatalog?: boolean;
   waitForInitialCommands?: boolean;
   initialCommandsTimeoutMs?: number;
+  /** Filter session/list results client-side when the ACP agent returns sessions across workspaces. */
+  filterSessionsByCwd?: boolean;
+  /** Probe selectable models during catalog discovery to capture model-specific thinking options. */
+  discoverThinkingPerModel?: boolean;
 }
 
 export interface AcpContext {
@@ -82,6 +89,8 @@ export interface AcpToolCallSnapshot {
   input: JsonValue;
   output: JsonValue;
   locations: readonly string[];
+  content?: JsonValue;
+  detail?: ProviderToolCallDetail;
 }
 
 export type AcpVendorUpdate =
@@ -101,6 +110,10 @@ export interface AcpTransformer {
     context: AcpContext,
   ): AcpVendorUpdate | readonly AcpVendorUpdate[] | null;
   toolCall?(toolCall: AcpToolCallSnapshot, context: AcpContext): AcpToolCallSnapshot;
+  /** Additional top-level `_meta` entries merged alongside `_paseo` on session creation/load/resume. */
+  sessionMeta?(config: ProviderSessionConfig): Record<string, JsonValue> | undefined;
+  /** Resolve an ACP session ID from legacy persistence records. */
+  readPersistenceSessionId?(persistence: ProviderPersistence): string | null | undefined;
 }
 
 export function runAcpProvider(options: RunAcpProviderOptions): ProviderRegistration {

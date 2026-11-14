@@ -42,10 +42,12 @@ import {
   type ProviderEvent,
   type ProviderInput,
   type ProviderLaunch,
+  type ProviderModel,
   type ProviderPermissionResponse,
   type ProviderPersistence,
   type ProviderSessionConfig,
   type ProviderSetting,
+  type ProviderThinkingOption,
   type ProviderTimelineItem,
   type ProviderUsage,
 } from "../provider.js";
@@ -84,7 +86,7 @@ export async function createAcpProviderConnection(
   if (probe.agentCapabilities.sessionCapabilities?.list) {
     supportedCapabilities.push("session.list");
   }
-  if (probe.agentCapabilities.loadSession) {
+  if (probe.agentCapabilities.loadSession || probe.agentCapabilities.sessionCapabilities?.resume) {
     supportedCapabilities.push("session.persistence");
   }
   await probe.close();
@@ -283,7 +285,19 @@ async function listSessions(
   });
   try {
     const response = await runtime.listSessions(input.cwd);
-    const selected = input.limit ? response.sessions.slice(0, input.limit) : response.sessions;
+    const needle = input.query?.trim().toLowerCase();
+    const filtered = response.sessions.filter((session) => {
+      if (state.options.acpOptions?.filterSessionsByCwd && input.cwd && session.cwd !== input.cwd) {
+        return false;
+      }
+      if (!needle) return true;
+      return (
+        session.sessionId.toLowerCase().includes(needle) ||
+        (session.title?.toLowerCase().includes(needle) ?? false) ||
+        session.cwd.toLowerCase().includes(needle)
+      );
+    });
+    const selected = input.limit ? filtered.slice(0, input.limit) : filtered;
     state.emit({
       type: "sessions",
       requestId: input.requestId,
@@ -491,29 +505,47 @@ class AcpRuntime {
     });
   }
 
+  private resolveNativeSessionId(persistence: ProviderPersistence | undefined): string | null {
+    if (!persistence) return null;
+    for (const transformer of this.transformers) {
+      const resolved = transformer.readPersistenceSessionId?.(persistence);
+      if (typeof resolved === "string" && resolved.length > 0) return resolved;
+    }
+    return readNativeSessionId(persistence);
+  }
+
+  private buildSessionMetadata(config: ProviderSessionConfig): Record<string, unknown> {
+    const metadata: Record<string, unknown> = {
+      _paseo: {
+        systemPrompt: config.systemPrompt,
+        providerOptions: config.providerOptions,
+        toolPolicy: config.toolPolicy,
+        persist: config.persist,
+      },
+    };
+    for (const transformer of this.transformers) {
+      const extra = transformer.sessionMeta?.(config);
+      if (extra) Object.assign(metadata, extra);
+    }
+    return metadata;
+  }
+
   async open(
     input: Extract<ProviderInput, { type: "session.open" }>,
     connectionCapabilities: readonly ProviderCapability[],
   ): Promise<readonly ProviderCapability[]> {
     const mcpServers = toAcpMcpServers(input.config);
-    const nativeSessionId = readNativeSessionId(input.persistence);
-    const metadata = {
-      _paseo: {
-        systemPrompt: input.config.systemPrompt,
-        providerOptions: input.config.providerOptions,
-        toolPolicy: input.config.toolPolicy,
-        persist: input.config.persist,
-      },
-    };
+    const nativeSessionId = this.resolveNativeSessionId(input.persistence);
+    const metadata = this.buildSessionMetadata(input.config);
     let response: Pick<NewSessionResponse, "modes" | "configOptions">;
     if (nativeSessionId) {
       // ACP agents replay the loaded session's updates before session/load resolves,
       // so the native id must be registered first for them to pass the session filter.
       this.nativeSessionId = nativeSessionId;
-      this.replayWindow = input.history === "replay" ? "replay" : "skip";
-      try {
+      const canResume = this.agentCapabilities.sessionCapabilities?.resume !== undefined;
+      if (input.history !== "replay" && canResume) {
         response = await this.call(
-          this.connection.loadSession({
+          this.connection.resumeSession({
             sessionId: nativeSessionId,
             cwd: input.config.cwd,
             mcpServers,
@@ -521,8 +553,21 @@ class AcpRuntime {
           }),
         );
         await this.drainNotifications();
-      } finally {
-        this.replayWindow = null;
+      } else {
+        this.replayWindow = input.history === "replay" ? "replay" : "skip";
+        try {
+          response = await this.call(
+            this.connection.loadSession({
+              sessionId: nativeSessionId,
+              cwd: input.config.cwd,
+              mcpServers,
+              _meta: metadata,
+            }),
+          );
+          await this.drainNotifications();
+        } finally {
+          this.replayWindow = null;
+        }
       }
     } else {
       const newSession = await this.call(
@@ -573,7 +618,48 @@ class AcpRuntime {
     this.nativeSessionId = response.sessionId;
     this.modes = response.modes;
     this.configOptions = response.configOptions ?? [];
-    return toProviderCatalog(response.modes, response.configOptions ?? []);
+    const thinkingByModel = this.options.options.acpOptions?.discoverThinkingPerModel
+      ? await this.probeThinkingByModel(this.configOptions)
+      : undefined;
+    return toProviderCatalog(response.modes, response.configOptions ?? [], thinkingByModel);
+  }
+
+  private async probeThinkingByModel(
+    initialOptions: readonly SessionConfigOption[],
+  ): Promise<Map<string, { options: ProviderThinkingOption[]; defaultId?: string }>> {
+    const result = new Map<string, { options: ProviderThinkingOption[]; defaultId?: string }>();
+    const model = modelOption(initialOptions);
+    if (!model || model.type === "boolean") return result;
+
+    const recordThinking = (options: readonly SessionConfigOption[], modelId: string) => {
+      const thinking = options.find((opt) => opt.category === "thought_level");
+      if (!thinking || thinking.type === "boolean") return;
+      const choices: ProviderThinkingOption[] = selectOptions(thinking).map((choice) => {
+        const option: ProviderThinkingOption = { id: choice.value, label: choice.label };
+        if (choice.value === thinking.currentValue) option.isDefault = true;
+        return option;
+      });
+      if (choices.length > 0)
+        result.set(modelId, { options: choices, defaultId: thinking.currentValue });
+    };
+
+    recordThinking(initialOptions, model.currentValue);
+    for (const candidate of selectOptions(model)) {
+      if (candidate.value === model.currentValue) continue;
+      try {
+        const updated = await this.call(
+          this.connection.setSessionConfigOption({
+            sessionId: this.nativeSessionId,
+            configId: model.id,
+            value: candidate.value,
+          }),
+        );
+        recordThinking(updated.configOptions, candidate.value);
+      } catch {
+        // Keep model without model-specific overrides when probing is unsupported.
+      }
+    }
+    return result;
   }
 
   prompt(input: Extract<ProviderInput, { type: "session.prompt" }>): Promise<void> {
@@ -922,6 +1008,12 @@ class AcpRuntime {
 
   private requestPermission(request: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     const permissionId = `permission:${request.toolCall.toolCallId}`;
+    let snapshot = mergeToolCallSnapshot(request.toolCall, undefined);
+    const context = { sessionId: this.options.boundarySessionId };
+    for (const transformer of this.transformers) {
+      snapshot = transformer.toolCall?.(snapshot, context) ?? snapshot;
+    }
+    const detail = snapshot.detail;
     return new Promise((resolve) => {
       this.permissions.set(permissionId, { request, resolve });
       this.emit({
@@ -933,6 +1025,7 @@ class AcpRuntime {
           kind: "tool",
           title: request.toolCall.title ?? undefined,
           input: jsonRecord(request.toolCall.rawInput),
+          ...(detail ? { detail } : {}),
           actions: request.options.map((option) => ({
             id: option.optionId,
             label: option.name,
@@ -1348,6 +1441,7 @@ function mergeToolCallSnapshot(
     input: jsonValue(firstDefined(update.rawInput, current?.input, null)),
     output: jsonValue(firstDefined(update.rawOutput, current?.output, null)),
     locations: update.locations?.map((location) => location.path) ?? current?.locations ?? [],
+    content: update.content !== undefined ? jsonValue(update.content) : current?.content,
   };
 }
 
@@ -1448,10 +1542,24 @@ function modelOption(options: readonly SessionConfigOption[]): SessionConfigOpti
 function toProviderCatalog(
   modes: NewSessionResponse["modes"],
   options: readonly SessionConfigOption[],
+  thinkingByModel?: ReadonlyMap<string, { options: ProviderThinkingOption[]; defaultId?: string }>,
 ): ProviderCatalog {
   const state = toProviderConfigState(modes, options);
+  const models: ProviderModel[] = thinkingByModel
+    ? state.models.map((model) => {
+        const entry: ProviderModel = { id: model.id, label: model.label };
+        if (model.description) entry.description = model.description;
+        if (model.id === state.model) entry.isDefault = true;
+        const perModel = thinkingByModel.get(model.id);
+        if (perModel && perModel.options.length > 0) {
+          entry.thinkingOptions = perModel.options;
+          entry.defaultThinkingOptionId = perModel.defaultId;
+        }
+        return entry;
+      })
+    : [...state.models];
   return {
-    models: state.models,
+    models,
     modes: state.modes,
     thinkingOptions: state.thinkingOptions,
     defaultModel: state.model,
@@ -1506,7 +1614,7 @@ type ToolCallTimelineItem = Extract<ProviderTimelineItem, { type: "tool_call" }>
 function toolTimelineItem(snapshot: AcpToolCallSnapshot): ToolCallTimelineItem {
   const input = jsonRecord(snapshot.input);
   const isEdit = snapshot.kind === "edit" || snapshot.name?.toLowerCase().includes("edit") === true;
-  const detail = isEdit
+  const fallbackDetail = isEdit
     ? {
         type: "edit" as const,
         filePath:
@@ -1516,6 +1624,7 @@ function toolTimelineItem(snapshot: AcpToolCallSnapshot): ToolCallTimelineItem {
         unifiedDiff: typeof input.unifiedDiff === "string" ? input.unifiedDiff : undefined,
       }
     : { type: "unknown" as const, input: snapshot.input, output: snapshot.output };
+  const detail = snapshot.detail ?? fallbackDetail;
   const status =
     snapshot.status === "in_progress" || snapshot.status === "pending"
       ? "running"

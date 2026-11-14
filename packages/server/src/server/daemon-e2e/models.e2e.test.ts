@@ -116,7 +116,9 @@ test("Antigravity creates an agent and answers a prompt with real agy", async ({
     agentClients: {},
     mcpEnabled: false,
     builtinPlugins: new BuiltinPluginLoader(undefined, ["antigravity-provider"]),
-    providerOverrides: { antigravity: { command: [command], paseoTools: { enabled: false } } },
+    providerOverrides: {
+      antigravity: { command: [command, "acp"], paseoTools: { enabled: false } },
+    },
   });
   const client = new DaemonClient({
     url: `ws://127.0.0.1:${daemon.port}/ws`,
@@ -136,17 +138,15 @@ test("Antigravity creates an agent and answers a prompt with real agy", async ({
       cwd,
       title: "Antigravity E2E",
     });
-    expect(agent.currentModeId).toBe("full-access");
-    expect(agent.availableModes?.map((mode) => mode.id)).toEqual(["full-access"]);
-    const openedTimeline = await client.fetchAgentTimeline(agent.id, { limit: 100 });
-    expect(openedTimeline.entries.map((entry) => entry.item)).toEqual([
-      {
-        type: "notification",
-        level: "warning",
-        message:
-          "Antigravity is running with full access\nAntigravity's CLI cannot ask for permission when another app drives it, so Paseo starts it with --dangerously-skip-permissions. Every tool call, including shell commands, runs without asking.",
-      },
+    expect(agent.currentModeId).toBe("default");
+    expect(agent.availableModes?.map((mode) => mode.id)).toEqual([
+      "default",
+      "accept-edits",
+      "auto",
+      "plan",
     ]);
+    const openedTimeline = await client.fetchAgentTimeline(agent.id, { limit: 100 });
+    expect(openedTimeline.entries).toEqual([]);
     await client.sendMessage(agent.id, "Reply with exactly ANTIGRAVITY_E2E_OK. No tools.");
     const result = await client.waitForFinish(agent.id, 90000);
     expect(result.status).toBe("idle");
