@@ -2014,4 +2014,210 @@ describe("ACP session history replay", () => {
       await connection.close();
     }
   });
+
+  it("supports sessionMeta, legacy persistence migration, resumeSession, cwd-filtered list, per-model thinking discovery, and custom tool detail", async () => {
+    const seenMethods: string[] = [];
+    let seenMeta: unknown;
+    const executable = await fakeAcp(`const readline = require("node:readline");
+const lines = readline.createInterface({ input: process.stdin });
+const send = (message) => process.stdout.write(JSON.stringify(message) + "\\n");
+let currentModel = "model-a";
+function configOptions() {
+  const thinking = [
+    { value: "low", name: "Low" },
+    { value: "high", name: "High" },
+  ];
+  if (currentModel === "model-b") thinking.push({ value: "xhigh", name: "Extra" });
+  return [
+    {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: currentModel,
+      options: [
+        { value: "model-a", name: "Model A" },
+        { value: "model-b", name: "Model B" },
+      ],
+    },
+    {
+      id: "thought_level",
+      name: "Thought Level",
+      category: "thought_level",
+      type: "select",
+      currentValue: "low",
+      options: thinking,
+    },
+  ];
+}
+lines.on("line", (line) => {
+  const msg = JSON.parse(line);
+  process.stderr.write("METHOD:" + msg.method + "\\n");
+  if (msg.method === "initialize") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        protocolVersion: msg.params.protocolVersion,
+        agentCapabilities: {
+          loadSession: true,
+          sessionCapabilities: { resume: {}, list: {}, close: {} },
+        },
+      },
+    });
+  } else if (msg.method === "session/new") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "acp-new", configOptions: configOptions(), metaSeen: msg.params._meta } });
+  } else if (msg.method === "session/set_config_option") {
+    if (msg.params.configId === "model") currentModel = msg.params.value;
+    send({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptions() } });
+  } else if (msg.method === "session/list") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: {
+        sessions: [
+          { sessionId: "s-1", cwd: "/repo-a", title: "A" },
+          { sessionId: "s-2", cwd: "/repo-b", title: "B" },
+        ],
+      },
+    });
+  } else if (msg.method === "session/resume") {
+    send({
+      jsonrpc: "2.0",
+      id: msg.id,
+      result: { configOptions: configOptions(), _metaSeen: msg.params._meta },
+    });
+  } else if (msg.method === "session/prompt") {
+    send({
+      jsonrpc: "2.0",
+      method: "session/update",
+      params: {
+        sessionId: msg.params.sessionId,
+        update: {
+          sessionUpdate: "tool_call",
+          toolCallId: "tc-1",
+          title: "Run command",
+          name: "run_command",
+          kind: "execute",
+          status: "completed",
+          rawInput: { CommandLine: "echo hi" },
+          rawOutput: { output: "hi" },
+        },
+      },
+    });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+  }
+});`);
+
+    const registration = runAcpProvider({
+      id: "enhanced-acp",
+      label: "Enhanced ACP",
+      command: [process.execPath, executable],
+      acpOptions: {
+        filterSessionsByCwd: true,
+        discoverThinkingPerModel: true,
+      },
+      transformers: [
+        {
+          sessionMeta(config) {
+            seenMeta = config.systemPrompt
+              ? { vendor: { append: config.systemPrompt } }
+              : undefined;
+            return config.systemPrompt ? { vendor: { append: config.systemPrompt } } : undefined;
+          },
+          readPersistenceSessionId(persistence) {
+            if (
+              persistence.data &&
+              typeof persistence.data === "object" &&
+              !Array.isArray(persistence.data) &&
+              typeof persistence.data.conversationId === "string"
+            ) {
+              return persistence.data.conversationId;
+            }
+            return null;
+          },
+          toolCall(snapshot) {
+            if (snapshot.kind === "execute") {
+              seenMethods.push(snapshot.id);
+              const input = snapshot.input as Record<string, string>;
+              return {
+                ...snapshot,
+                detail: { type: "shell", command: input.CommandLine ?? "" },
+              };
+            }
+            return snapshot;
+          },
+        },
+      ],
+    });
+    const connection = await registration.connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.list", "session.persistence", "session.configure"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+
+    try {
+      await connection.send({ type: "catalog", requestId: "cat-1", cwd: "/repo-a" });
+      const catalogEvent = await waitForEvent(
+        events,
+        (event): event is Extract<ProviderEvent, { type: "catalog" }> => event.type === "catalog",
+      );
+      const modelB = catalogEvent.catalog.models.find((m) => m.id === "model-b");
+      expect(modelB?.thinkingOptions?.map((o) => o.id)).toEqual(["low", "high", "xhigh"]);
+
+      await connection.send({ type: "sessions", requestId: "list-1", cwd: "/repo-a" });
+      const listEvent = await waitForEvent(
+        events,
+        (event): event is Extract<ProviderEvent, { type: "sessions" }> => event.type === "sessions",
+      );
+      expect(listEvent.sessions.map((s) => s.persistence.data)).toEqual([{ sessionId: "s-1" }]);
+
+      await connection.send({
+        type: "session.open",
+        requestId: "open-1",
+        sessionId: "boundary-1",
+        history: "skip",
+        persistence: { version: 1, data: { conversationId: "legacy-123" } },
+        config: {
+          cwd: "/repo-a",
+          env: {},
+          systemPrompt: "Append me",
+          mcpServers: {},
+          settings: {},
+          persist: true,
+        },
+      });
+      const opened = await waitForEvent(
+        events,
+        (event): event is Extract<ProviderEvent, { type: "session.opened" }> =>
+          event.type === "session.opened",
+      );
+      expect(opened.persistence).toEqual({ version: 1, data: { sessionId: "legacy-123" } });
+      expect(seenMeta).toEqual({ vendor: { append: "Append me" } });
+      await waitForEvent(events, (event) => event.type === "session.ready");
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "boundary-1",
+        prompt: {
+          clientMessageId: "m-1",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "hi" }] },
+        },
+      });
+      const toolEvent = await waitForEvent(
+        events,
+        (event): event is Extract<ProviderEvent, { type: "timeline.item" }> =>
+          event.type === "timeline.item" && event.item.type === "tool_call",
+      );
+      expect(toolEvent.item).toMatchObject({
+        type: "tool_call",
+        detail: { type: "shell", command: "echo hi" },
+      });
+      expect(seenMethods).toEqual(["tc-1"]);
+    } finally {
+      await connection.close();
+    }
+  });
 });

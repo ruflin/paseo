@@ -23,32 +23,26 @@ Work out of the box once the underlying CLI is installed and authenticated.
 
 ### Antigravity
 
-Install the Antigravity CLI (`agy`) on your daemon host, then run `agy` once to sign in. Pick
-**Antigravity** in Paseo. The provider ships with Paseo; no separate plugin install is required.
+Install the Antigravity CLI (`agy` `1.5.0` or newer) on your daemon host, then run `agy` once to
+sign in. Pick **Antigravity** in Paseo. The provider ships with Paseo; no separate plugin install is
+required.
 
-**Full access** is the only permission mode. Antigravity cannot ask for permission when another
-app drives it, so Paseo starts `agy` with `--dangerously-skip-permissions`. Every tool call,
-including shell commands, runs without asking. Each session starts with a warning explaining
-this, including when you reopen a chat. Antigravity's own policy can still deny
-an action.
-
-After a daemon restart, Antigravity remembers the conversation, but Paseo's transcript starts
-fresh because `agy` does not replay its history.
+Paseo connects over `agy acp` and supports permission modes (`default`, `accept-edits`, `auto`, and
+`plan`), interactive tool approval prompts, per-model thinking levels, slash commands, Paseo MCP
+tools, inline image attachments, session listing, and history replay on resume. Sending a message
+mid-turn cancels the active turn before sending the new prompt.
 
 This integration uses your installed CLI and sign-in. It is not endorsed by Google.
 
-Paseo MCP tools and steering are unavailable. Your own `agy` MCP servers still work. Attached
-images are passed as file references for the agent to read.
-
-If `agy` is outside your daemon's PATH, override its command in `~/.paseo/config.json`. Use `env`
-for provider-specific environment variables:
+If `agy` is outside your daemon's PATH, override its command in `~/.paseo/config.json`. Keep
+`"acp"` as the argument when launching ACP mode:
 
 ```json
 {
   "agents": {
     "providers": {
       "antigravity": {
-        "command": ["/absolute/path/to/agy"],
+        "command": ["/absolute/path/to/agy", "acp"],
         "env": { "EXAMPLE_VARIABLE": "value" }
       }
     }
