@@ -1,397 +1,788 @@
 import { randomUUID } from "node:crypto";
-import { z } from "zod";
 import type {
-  ProviderCatalog,
+  ProviderCapability,
   ProviderConfigChanges,
   ProviderEvent,
+  ProviderInput,
+  ProviderLaunch,
   ProviderPersistence,
   ProviderPrompt,
-  ProviderSessionConfig,
-  ProviderLaunch,
-  ProviderTimelineItem,
   ProviderUsage,
 } from "@getpaseo/plugin/server/provider";
-import { startDriver, selection, type Driver } from "./process.js";
-import { validateSelection } from "./catalog.js";
-import { PromptFiles } from "./prompt.js";
-import { toolItem } from "./timeline.js";
-import { AntigravityError, diagnostic, type Frame, type Step } from "./wire.js";
+import { type AcpClient, type AcpIncomingRequest, startAcpClient } from "./acp-client.js";
+import { encodePrompt } from "./prompt.js";
+import {
+  reduceToolCall,
+  selectPermissionOption,
+  toPermissionRequest,
+  toToolTimelineItem,
+  type ToolCallSnapshot,
+  type ToolCallTimelineItem,
+} from "./timeline.js";
+import {
+  ACP_PROTOCOL_VERSION,
+  AcpInitializeResultSchema,
+  AcpPermissionRequestParamsSchema,
+  AcpPromptResultSchema,
+  AcpSessionMutateResultSchema,
+  AcpSessionResultSchema,
+  AcpSessionUpdateParamsSchema,
+  AntigravityError,
+  diagnostic,
+  findModeOption,
+  findModelOption,
+  findThinkingOption,
+  toAcpMcpServers,
+  toProviderConfigState,
+  type AcpConfigOption,
+  type AcpInitializeResult,
+  type AcpModes,
+  type AcpPermissionRequestParams,
+  type AcpSessionResult,
+  type AcpSessionUpdate,
+} from "./wire.js";
 
-const persistenceSchema = z
-  .object({ version: z.literal(1), data: z.object({ conversationId: z.string().min(1) }).strict() })
-  .strict();
-interface Turn {
-  id: string;
-  text: Map<number, string>;
-  usageSteps: Set<number>;
-  tools: Map<string, Extract<ProviderTimelineItem, { type: "tool_call" }>>;
-  usage: Required<Pick<ProviderUsage, "inputTokens" | "outputTokens" | "cachedInputTokens">>;
+const OPEN_TIMEOUT_MS = 30_000;
+const INITIAL_COMMANDS_WAIT_MS = 100;
+
+interface PendingPermission {
+  request: AcpPermissionRequestParams;
+  incoming: AcpIncomingRequest;
 }
-type State =
-  | { type: "dormant" }
-  | { type: "starting"; driver: Driver }
-  | { type: "idle"; driver: Driver }
-  | { type: "running"; driver: Driver; turn: Turn }
-  | { type: "stopping"; driver: Driver }
-  | { type: "closed" };
-interface SessionOptions {
+
+interface TextSegmentTracker {
+  kind: "user" | "assistant" | "thought" | null;
+  id: string | null;
+  buffer: string;
+  counter: number;
+}
+
+interface ActiveTurn {
   id: string;
-  config: ProviderSessionConfig;
+  settled: Promise<void>;
+  tools: Map<string, ToolCallTimelineItem>;
+  snapshots: Map<string, ToolCallSnapshot>;
+  segments: TextSegmentTracker;
+}
+
+export interface SessionOptions {
   launch: ProviderLaunch;
-  catalog(): ProviderCatalog;
-  persistence?: ProviderPersistence;
+  capabilities: readonly ProviderCapability[];
   emit(event: ProviderEvent): void;
+  onTerminated(): void;
 }
 
-export class Session {
-  private state: State = { type: "dormant" };
-  private config: ProviderSessionConfig;
-  private conversationId: string | null;
-  private firstMessage: boolean;
-  private readonly promptFiles = new PromptFiles();
-  private readonly reportedDenials = new Map<string, number>();
-
-  constructor(private readonly options: SessionOptions) {
-    this.config = { ...options.config, mode: options.config.mode ?? "full-access" };
-    this.conversationId = options.persistence
-      ? persistenceSchema.parse(options.persistence).data.conversationId
-      : null;
-    this.firstMessage = this.conversationId === null;
-    validateSelection(this.config, options.catalog());
+export function readPersistedSessionId(
+  persistence: ProviderPersistence | undefined,
+): string | null {
+  if (
+    !persistence ||
+    typeof persistence.data !== "object" ||
+    persistence.data === null ||
+    Array.isArray(persistence.data)
+  ) {
+    return null;
   }
+  const data = persistence.data as Record<string, unknown>;
+  if (typeof data.sessionId === "string" && data.sessionId.length > 0) return data.sessionId;
+  // Legacy persistence migration from stream-json Antigravity provider
+  if (typeof data.conversationId === "string" && data.conversationId.length > 0) {
+    return data.conversationId;
+  }
+  return null;
+}
 
-  async open(requestId: string, capabilities: readonly string[]): Promise<void> {
-    await this.ensureDriver();
-    this.emit({
-      type: "session.opened",
-      requestId,
-      sessionId: this.options.id,
-      capabilities,
-      restoration: "core",
-      persistence: this.config.persist ? this.persistence() : undefined,
-      cwd: this.config.cwd,
-      title: this.config.title,
+function createTracker(): TextSegmentTracker {
+  return { kind: null, id: null, buffer: "", counter: 0 };
+}
+
+function resetTracker(tracker: TextSegmentTracker): void {
+  tracker.kind = null;
+  tracker.id = null;
+  tracker.buffer = "";
+}
+
+function planToTodoItems(entries: Extract<AcpSessionUpdate, { sessionUpdate: "plan" }>["entries"]) {
+  return entries.map((entry) => ({
+    text: entry.content,
+    completed: entry.status === "completed",
+    status:
+      entry.status === "completed" || entry.status === "in_progress"
+        ? (entry.status as "completed" | "in_progress")
+        : ("pending" as const),
+  }));
+}
+
+export class AntigravitySession {
+  private client: AcpClient | null = null;
+  private initResult: AcpInitializeResult | null = null;
+  private nativeSessionId: string | null = null;
+  private modes: AcpModes | null = null;
+  private configOptions: AcpConfigOption[] = [];
+  private usage: ProviderUsage = {};
+  private replayMode: "replay" | "skip" | null = null;
+  private replayTracker = createTracker();
+  private replaySnapshots = new Map<string, ToolCallSnapshot>();
+
+  private activeTurn: ActiveTurn | null = null;
+  private promptLane: Promise<void> = Promise.resolve();
+  private notificationQueue: Promise<void> = Promise.resolve();
+  private permissions = new Map<string, PendingPermission>();
+  private closed = false;
+
+  private commandsReceived = false;
+  private commandsWaiter: (() => void) | null = null;
+
+  constructor(
+    private readonly boundarySessionId: string,
+    private readonly options: SessionOptions,
+  ) {}
+
+  async open(input: Extract<ProviderInput, { type: "session.open" }>): Promise<void> {
+    const client = startAcpClient({
+      launch: this.options.launch,
+      cwd: input.config.cwd,
+      env: input.config.env,
+      onNotification: (method, params) => {
+        this.notificationQueue = this.notificationQueue.then(() =>
+          this.handleNotification(method, params),
+        );
+      },
+      onRequest: (incoming) => this.handleRequest(incoming),
+      onExit: (error) => this.handleUnexpectedExit(error),
     });
-    this.publishFullAccessNotice();
-    this.publishConfig();
-    this.emit({ type: "session.commands", sessionId: this.options.id, commands: [] });
-    this.emit({ type: "session.ready", requestId, sessionId: this.options.id });
-  }
+    this.client = client;
 
-  async prompt(prompt: ProviderPrompt): Promise<void> {
-    if (this.state.type === "running")
-      throw new AntigravityError(
-        "Antigravity already has an active turn; wait for it to finish",
-        "TURN_ACTIVE",
+    try {
+      const init = AcpInitializeResultSchema.parse(
+        await client.request(
+          "initialize",
+          { protocolVersion: ACP_PROTOCOL_VERSION, clientCapabilities: {} },
+          OPEN_TIMEOUT_MS,
+        ),
       );
-    const { text, nativeText } = await this.promptFiles.encode(prompt);
-    await this.ensureDriver();
-    if (this.state.type !== "idle") throw new AntigravityError("Antigravity session is not ready");
-    const driver = this.state.driver;
-    const turn: Turn = {
-      id: randomUUID(),
-      text: new Map(),
-      usageSteps: new Set(),
-      tools: new Map(),
-      usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 },
-    };
-    this.state = { type: "running", driver, turn };
-    this.emit({
-      type: "session.prompt_result",
-      sessionId: this.options.id,
-      clientMessageId: prompt.clientMessageId,
-      result: { type: "turn", turnId: turn.id },
-    });
-    this.emit({
-      type: "session.turn",
-      sessionId: this.options.id,
-      turnId: turn.id,
-      state: "started",
-    });
-    this.item({
-      type: "user_message",
-      id: prompt.clientMessageId,
-      clientMessageId: prompt.clientMessageId,
-      text,
-    });
-    const driverText =
-      this.firstMessage && this.config.systemPrompt
-        ? `${this.config.systemPrompt}\n\n${nativeText}`
-        : nativeText;
-    try {
-      await driver.prompt(driverText);
-      this.firstMessage = false;
-    } catch (error) {
-      if (!(error instanceof Error)) throw error;
-      this.failTurn(new AntigravityError(error.message));
-      await driver.stop("interrupt");
-    }
-  }
+      this.initResult = init;
 
-  configure(changes: ProviderConfigChanges): void {
-    const config = {
-      ...this.config,
-      model: changes.model === null ? undefined : (changes.model ?? this.config.model),
-      mode: changes.mode === null ? "full-access" : (changes.mode ?? this.config.mode),
-      thinkingOption:
-        changes.thinkingOption === null
-          ? undefined
-          : (changes.thinkingOption ?? this.config.thinkingOption),
-    };
-    if (changes.settings && Object.keys(changes.settings).length > 0)
-      throw new AntigravityError("Antigravity has no configurable settings");
-    validateSelection(config, this.options.catalog());
-    this.config = config;
-    this.publishConfig();
-  }
+      const result = await this.openOrResumeSession(client, init, input);
+      this.modes = result.modes ?? null;
+      this.configOptions = result.configOptions ?? [];
 
-  async interrupt(): Promise<void> {
-    if (this.state.type !== "running") return;
-    const { driver, turn } = this.state;
-    this.state = { type: "stopping", driver };
-    await driver.stop("interrupt");
-    this.finishTools(turn, "canceled");
-    this.emit({
-      type: "session.turn",
-      sessionId: this.options.id,
-      turnId: turn.id,
-      state: "canceled",
-    });
-    this.state = { type: "dormant" };
-  }
-
-  async close(): Promise<void> {
-    const state = this.state;
-    this.state = { type: "closed" };
-    try {
-      if (state.type !== "dormant" && state.type !== "closed") await state.driver.stop("close");
-    } finally {
-      await this.promptFiles.close();
-    }
-    if (state.type === "running") {
-      this.finishTools(state.turn, "canceled");
-      this.emit({
-        type: "session.turn",
-        sessionId: this.options.id,
-        turnId: state.turn.id,
-        state: "canceled",
+      await this.applyConfig({
+        model: input.config.model,
+        thinkingOption: input.config.thinkingOption,
+        mode: input.config.mode,
       });
+
+      this.emit({
+        type: "session.opened",
+        requestId: input.requestId,
+        sessionId: this.boundarySessionId,
+        capabilities: this.negotiateSessionCapabilities(init),
+        restoration: "core",
+        persistence: { version: 1, data: { sessionId: result.sessionId } },
+        title: input.config.title,
+        cwd: input.config.cwd,
+      });
+      this.publishConfig();
+      await this.waitForInitialCommands();
+      this.emit({
+        type: "session.ready",
+        requestId: input.requestId,
+        sessionId: this.boundarySessionId,
+      });
+    } catch (error) {
+      this.closed = true;
+      this.options.onTerminated();
+      await client.stop("close").catch(() => undefined);
+      throw error instanceof AntigravityError
+        ? error
+        : new AntigravityError(error instanceof Error ? diagnostic(error.message) : String(error));
     }
   }
 
-  private publishFullAccessNotice(): void {
+  private async openOrResumeSession(
+    client: AcpClient,
+    init: AcpInitializeResult,
+    input: Extract<ProviderInput, { type: "session.open" }>,
+  ): Promise<AcpSessionResult> {
+    const mcpServers = toAcpMcpServers(input.config.mcpServers);
+    const metaFields = input.config.systemPrompt
+      ? { _meta: { antigravity: { systemPrompt: { append: input.config.systemPrompt } } } }
+      : {};
+    const resumeId = readPersistedSessionId(input.persistence);
+
+    if (!resumeId) {
+      const created = AcpSessionResultSchema.parse(
+        await client.request(
+          "session/new",
+          { cwd: input.config.cwd, mcpServers, ...metaFields },
+          OPEN_TIMEOUT_MS,
+        ),
+      );
+      this.nativeSessionId = created.sessionId;
+      return created;
+    }
+
+    this.nativeSessionId = resumeId;
+    const canLoad = init.agentCapabilities?.loadSession === true;
+    const canResume = init.agentCapabilities?.sessionCapabilities?.resume !== undefined;
+
+    if (input.history === "replay" && canLoad) {
+      return this.loadExistingSession(
+        client,
+        resumeId,
+        input.config.cwd,
+        mcpServers,
+        metaFields,
+        "replay",
+      );
+    }
+    if (canResume) {
+      const resumed = AcpSessionMutateResultSchema.parse(
+        await client.request(
+          "session/resume",
+          { sessionId: resumeId, cwd: input.config.cwd, mcpServers, ...metaFields },
+          OPEN_TIMEOUT_MS,
+        ),
+      );
+      await this.drainNotifications();
+      return { sessionId: resumeId, ...resumed };
+    }
+    if (canLoad) {
+      return this.loadExistingSession(
+        client,
+        resumeId,
+        input.config.cwd,
+        mcpServers,
+        metaFields,
+        "skip",
+      );
+    }
+    throw new AntigravityError(
+      "Antigravity ACP agent does not support resuming sessions",
+      "RESUME_UNSUPPORTED",
+    );
+  }
+
+  private async loadExistingSession(
+    client: AcpClient,
+    sessionId: string,
+    cwd: string,
+    mcpServers: ReturnType<typeof toAcpMcpServers>,
+    metaFields: Record<string, unknown>,
+    replayMode: "replay" | "skip",
+  ): Promise<AcpSessionResult> {
+    this.replayMode = replayMode;
+    try {
+      const loaded = AcpSessionMutateResultSchema.parse(
+        await client.request(
+          "session/load",
+          { sessionId, cwd, mcpServers, ...metaFields },
+          OPEN_TIMEOUT_MS,
+        ),
+      );
+      await this.drainNotifications();
+      return { sessionId, ...loaded };
+    } finally {
+      this.replayMode = null;
+    }
+  }
+
+  private negotiateSessionCapabilities(init: AcpInitializeResult): readonly ProviderCapability[] {
+    const supportsImage = init.agentCapabilities?.promptCapabilities?.image !== false;
+    const supportsConfigure = this.modes !== null || this.configOptions.length > 0;
+    return this.options.capabilities.filter((cap) => {
+      if (cap === "prompt.image" && !supportsImage) return false;
+      if (cap === "session.configure" && !supportsConfigure) return false;
+      return true;
+    });
+  }
+
+  private handleUnexpectedExit(error: AntigravityError | null): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.cancelAllPermissions();
+    this.options.onTerminated();
     this.emit({
-      type: "session.notice",
-      sessionId: this.options.id,
-      notice: {
-        id: `${this.options.id}:full-access`,
-        severity: "warning",
-        title: "Antigravity is running with full access",
-        description:
-          "Antigravity's CLI cannot ask for permission when another app drives it, so Paseo starts it with --dangerously-skip-permissions. Every tool call, including shell commands, runs without asking.",
+      type: "session.runtime_failed",
+      sessionId: this.boundarySessionId,
+      error: {
+        message: error?.message ?? "Antigravity ACP process exited unexpectedly",
+        ...(error?.code ? { code: error.code } : {}),
       },
     });
   }
 
-  private async ensureDriver(): Promise<void> {
-    if (this.state.type === "closed") throw new AntigravityError("Antigravity session is closed");
-    if (this.state.type === "stopping") {
-      await this.state.driver.stop("interrupt");
-      this.state = { type: "dormant" };
+  prompt(prompt: ProviderPrompt): Promise<void> {
+    const admission = this.promptLane.then(() => this.runPrompt(prompt));
+    this.promptLane = admission.catch(() => undefined);
+    return admission;
+  }
+
+  private async runPrompt(prompt: ProviderPrompt): Promise<void> {
+    if (this.closed || !this.client || !this.nativeSessionId) {
+      this.emit({
+        type: "session.prompt_result",
+        sessionId: this.boundarySessionId,
+        clientMessageId: prompt.clientMessageId,
+        result: { type: "failed", error: { message: "Antigravity session is closed" } },
+      });
+      return;
     }
-    if (this.state.type === "idle" && this.state.driver.selection !== selection(this.config)) {
-      const driver = this.state.driver;
-      this.state = { type: "stopping", driver };
-      await driver.stop("close");
-      this.state = { type: "dormant" };
+
+    if (this.activeTurn) {
+      await this.interrupt();
+      await this.activeTurn.settled;
     }
-    if (this.state.type !== "dormant") return;
-    this.reportedDenials.clear();
-    const driver = startDriver({
-      launch: this.options.launch,
-      config: this.config,
-      conversationId: this.conversationId,
-      onFrame: (frame) => this.accept(frame),
-      onExit: (error) => this.failTurn(error),
+    if (prompt.clearPendingPermissions) {
+      this.cancelAllPermissions();
+    }
+
+    const supportsImage = this.initResult?.agentCapabilities?.promptCapabilities?.image !== false;
+    const { blocks, summaryText } = encodePrompt(prompt, { image: supportsImage });
+    const turnId = `acp:${prompt.clientMessageId}`;
+
+    const turn: ActiveTurn = {
+      id: turnId,
+      settled: Promise.resolve(),
+      tools: new Map(),
+      snapshots: new Map(),
+      segments: createTracker(),
+    };
+
+    this.emit({
+      type: "timeline.item",
+      sessionId: this.boundarySessionId,
+      item: {
+        type: "user_message",
+        id: prompt.clientMessageId,
+        text: summaryText,
+        clientMessageId: prompt.clientMessageId,
+      },
     });
-    this.state = { type: "starting", driver };
-    try {
-      const init = await driver.ready;
-      if (this.conversationId !== null && init.conversation_id !== this.conversationId)
-        throw new AntigravityError(
-          "Antigravity restored a different conversation",
-          "INVALID_RESUME",
-        );
-      this.conversationId = init.conversation_id;
-      this.state = { type: "idle", driver };
-      if (this.config.persist)
-        this.emit({
-          type: "session.persistence",
-          sessionId: this.options.id,
-          persistence: this.persistence(),
-        });
-    } catch (error) {
-      this.state = { type: "dormant" };
-      await driver.stop("interrupt");
-      throw error;
+    this.emit({
+      type: "session.prompt_result",
+      sessionId: this.boundarySessionId,
+      clientMessageId: prompt.clientMessageId,
+      result: { type: "turn", turnId },
+    });
+    this.emit({
+      type: "session.turn",
+      sessionId: this.boundarySessionId,
+      turnId,
+      state: "started",
+    });
+
+    const settled = this.client
+      .request("session/prompt", { sessionId: this.nativeSessionId, prompt: blocks }, 0)
+      .then(
+        async (raw) => {
+          await this.drainNotifications();
+          this.completeTurn(turn, AcpPromptResultSchema.parse(raw));
+          return undefined;
+        },
+        async (error) => {
+          await this.drainNotifications();
+          this.failTurn(turn, error);
+          return undefined;
+        },
+      );
+
+    turn.settled = settled;
+    this.activeTurn = turn;
+  }
+
+  private completeTurn(
+    turn: ActiveTurn,
+    result: ReturnType<typeof AcpPromptResultSchema.parse>,
+  ): void {
+    if (result.usage) {
+      this.usage = {
+        ...this.usage,
+        inputTokens: result.usage.inputTokens ?? this.usage.inputTokens,
+        outputTokens: result.usage.outputTokens ?? this.usage.outputTokens,
+        cachedInputTokens: result.usage.cachedReadTokens ?? this.usage.cachedInputTokens,
+      };
+      this.emit({
+        type: "session.usage",
+        sessionId: this.boundarySessionId,
+        turnId: turn.id,
+        usage: { ...this.usage },
+      });
+    }
+    const state = result.stopReason === "cancelled" ? "canceled" : "completed";
+    this.finishTurnTools(turn, state);
+    if (this.activeTurn === turn) this.activeTurn = null;
+    this.emit({
+      type: "session.turn",
+      sessionId: this.boundarySessionId,
+      turnId: turn.id,
+      state,
+    });
+  }
+
+  private failTurn(turn: ActiveTurn, error: unknown): void {
+    this.finishTurnTools(turn, "failed");
+    if (this.activeTurn === turn) this.activeTurn = null;
+    if (this.closed) return;
+    this.emit({
+      type: "session.turn",
+      sessionId: this.boundarySessionId,
+      turnId: turn.id,
+      state: "failed",
+      error: {
+        message: error instanceof Error ? diagnostic(error.message) : String(error),
+        ...(error instanceof AntigravityError && error.code ? { code: error.code } : {}),
+      },
+    });
+  }
+
+  async interrupt(): Promise<void> {
+    if (this.closed || !this.client || !this.nativeSessionId) return;
+    this.client.notify("session/cancel", { sessionId: this.nativeSessionId });
+    this.cancelAllPermissions();
+  }
+
+  respondPermission(
+    permissionId: string,
+    response: Extract<ProviderInput, { type: "session.permission" }>["response"],
+  ): void {
+    const pending = this.permissions.get(permissionId);
+    if (!pending) return;
+    const selected = selectPermissionOption(pending.request.options, response);
+    if (response.selectedActionId !== undefined && !selected) {
+      throw new AntigravityError(
+        `Invalid permission action '${response.selectedActionId}' for behavior '${response.behavior}'`,
+        "INVALID_PERMISSION",
+      );
+    }
+    this.permissions.delete(permissionId);
+    pending.incoming.reply({
+      outcome: selected
+        ? { outcome: "selected", optionId: selected.optionId }
+        : { outcome: "cancelled" },
+    });
+    this.emit({
+      type: "session.permission_resolved",
+      sessionId: this.boundarySessionId,
+      permissionId,
+    });
+  }
+
+  async configure(changes: ProviderConfigChanges): Promise<void> {
+    if (this.closed || !this.client || !this.nativeSessionId) {
+      throw new AntigravityError("Antigravity session is closed", "SESSION_CLOSED");
+    }
+    await this.applyConfig({
+      model: changes.model ?? undefined,
+      thinkingOption: changes.thinkingOption ?? undefined,
+      mode: changes.mode ?? undefined,
+    });
+    this.publishConfig();
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.cancelAllPermissions();
+    this.options.onTerminated();
+    const client = this.client;
+    const sessionId = this.nativeSessionId;
+    this.client = null;
+    if (client) {
+      if (
+        sessionId &&
+        this.initResult?.agentCapabilities?.sessionCapabilities?.close !== undefined
+      ) {
+        await client.request("session/close", { sessionId }, 2_000).catch(() => undefined);
+      }
+      await client.stop("close").catch(() => undefined);
+    }
+    this.emit({ type: "session.closed", sessionId: this.boundarySessionId });
+  }
+
+  private async setSelectOptionIfNeeded(
+    option: AcpConfigOption | undefined,
+    value: string | undefined,
+  ): Promise<void> {
+    if (value === undefined || !option || !this.client || !this.nativeSessionId) return;
+    if (option.type === "select" && option.currentValue === value) return;
+    const res = AcpSessionMutateResultSchema.parse(
+      await this.client.request("session/set_config_option", {
+        sessionId: this.nativeSessionId,
+        configId: option.id,
+        value,
+      }),
+    );
+    if (res.configOptions) this.configOptions = res.configOptions;
+    if (res.modes) this.modes = res.modes;
+  }
+
+  private async applyConfig(target: {
+    model?: string;
+    thinkingOption?: string;
+    mode?: string;
+  }): Promise<void> {
+    if (!this.client || !this.nativeSessionId) return;
+    await this.setSelectOptionIfNeeded(findModelOption(this.configOptions), target.model);
+    await this.setSelectOptionIfNeeded(
+      findThinkingOption(this.configOptions),
+      target.thinkingOption,
+    );
+    if (target.mode === undefined) return;
+
+    const modeOption = findModeOption(this.configOptions);
+    if (modeOption) {
+      await this.setSelectOptionIfNeeded(modeOption, target.mode);
+      if (this.modes && this.modes.currentModeId !== target.mode) {
+        this.modes = { ...this.modes, currentModeId: target.mode };
+      }
+      return;
+    }
+    if (this.modes && this.modes.currentModeId !== target.mode) {
+      await this.client.request("session/set_mode", {
+        sessionId: this.nativeSessionId,
+        modeId: target.mode,
+      });
+      this.modes = { ...this.modes, currentModeId: target.mode };
     }
   }
 
-  private accept(frame: Frame): void {
-    if (this.state.type !== "running") return;
-    const { turn, driver } = this.state;
-    if (frame.event === "step_update") {
-      this.acceptStep(frame.step_update, turn);
+  private handleRequest(incoming: AcpIncomingRequest): void {
+    if (incoming.method !== "session/request_permission") {
+      incoming.fail(-32601, `Method not found: ${incoming.method}`);
       return;
     }
-    if (frame.event !== "result") return;
-    const result = frame.result;
-    const denied = takeNewDenials(result.denied_actions, this.reportedDenials);
-    if (denied.length > 0) {
+    let parsed: AcpPermissionRequestParams;
+    try {
+      parsed = AcpPermissionRequestParamsSchema.parse(incoming.params);
+    } catch (error) {
+      incoming.fail(-32602, error instanceof Error ? error.message : String(error));
+      return;
+    }
+    if (parsed.sessionId !== this.nativeSessionId) {
+      incoming.reply({ outcome: { outcome: "cancelled" } });
+      return;
+    }
+    const permissionId = `perm:${randomUUID()}`;
+    this.permissions.set(permissionId, { request: parsed, incoming });
+    this.emit({
+      type: "session.permission",
+      sessionId: this.boundarySessionId,
+      request: toPermissionRequest(permissionId, parsed),
+    });
+  }
+
+  private handleNotification(method: string, params: unknown): void {
+    if (method !== "session/update") return;
+    const parsed = AcpSessionUpdateParamsSchema.safeParse(params);
+    if (!parsed.success || parsed.data.sessionId !== this.nativeSessionId) return;
+    this.applyUpdate(parsed.data.update);
+  }
+
+  private applyMetadataUpdate(update: AcpSessionUpdate): boolean {
+    if (update.sessionUpdate === "available_commands_update") {
+      this.commandsReceived = true;
+      this.commandsWaiter?.();
+      this.commandsWaiter = null;
       this.emit({
-        type: "session.notice",
-        sessionId: this.options.id,
-        notice: {
-          id: `${turn.id}:denied`,
-          severity: "warning",
-          title: denialNoticeTitle(denied),
-          description: "Antigravity's own policy denied it.",
+        type: "session.commands",
+        sessionId: this.boundarySessionId,
+        commands: update.availableCommands.map((cmd) => ({
+          name: cmd.name,
+          description: cmd.description ?? "",
+          ...(cmd.input?.hint ? { argumentHint: cmd.input.hint } : {}),
+        })),
+      });
+      return true;
+    }
+    if (update.sessionUpdate === "config_option_update") {
+      this.configOptions = update.configOptions;
+      this.publishConfig();
+      return true;
+    }
+    if (update.sessionUpdate === "current_mode_update") {
+      if (this.modes) {
+        this.modes = { ...this.modes, currentModeId: update.currentModeId };
+        this.publishConfig();
+      }
+      return true;
+    }
+    if (update.sessionUpdate === "usage_update") {
+      this.usage = {
+        ...this.usage,
+        contextWindowUsedTokens: update.used,
+        contextWindowMaxTokens: update.size,
+      };
+      this.emit({
+        type: "session.usage",
+        sessionId: this.boundarySessionId,
+        ...(this.activeTurn ? { turnId: this.activeTurn.id } : {}),
+        usage: { ...this.usage },
+      });
+      return true;
+    }
+    return update.sessionUpdate === "session_info_update";
+  }
+
+  private applyUpdate(update: AcpSessionUpdate): void {
+    if (this.applyMetadataUpdate(update)) return;
+    if (this.replayMode === "skip") return;
+    if (this.replayMode === "replay") {
+      this.applyTimelineUpdate(update, "replay", this.replayTracker, this.replaySnapshots);
+      return;
+    }
+    const turn = this.activeTurn;
+    if (!turn || update.sessionUpdate === "user_message_chunk") return;
+    this.applyTimelineUpdate(update, turn.id, turn.segments, turn.snapshots, turn.tools);
+  }
+
+  private emitChunkSegment(
+    prefix: string,
+    kind: "user" | "assistant" | "thought",
+    delta: string,
+    tracker: TextSegmentTracker,
+  ): void {
+    if (!delta) return;
+    if (tracker.kind !== kind || !tracker.id) {
+      tracker.kind = kind;
+      tracker.counter += 1;
+      tracker.id = `${prefix}:${kind}:${tracker.counter}`;
+      tracker.buffer = "";
+    }
+    tracker.buffer += delta;
+    if (kind === "user") {
+      this.emit({
+        type: "timeline.item",
+        sessionId: this.boundarySessionId,
+        item: { type: "user_message", id: tracker.id, text: tracker.buffer },
+      });
+      return;
+    }
+    if (kind === "thought") {
+      this.emit({
+        type: "timeline.item",
+        sessionId: this.boundarySessionId,
+        item: { type: "reasoning", id: tracker.id, text: tracker.buffer },
+      });
+      return;
+    }
+    this.emit({
+      type: "timeline.item",
+      sessionId: this.boundarySessionId,
+      item: {
+        type: "assistant_message",
+        id: tracker.id,
+        messageId: tracker.id,
+        text: tracker.buffer,
+      },
+    });
+  }
+
+  private applyTimelineUpdate(
+    update: AcpSessionUpdate,
+    prefix: string,
+    tracker: TextSegmentTracker,
+    snapshots: Map<string, ToolCallSnapshot>,
+    turnTools?: Map<string, ToolCallTimelineItem>,
+  ): void {
+    if (update.sessionUpdate === "user_message_chunk") {
+      const delta = update.content.type === "text" ? (update.content.text ?? "") : "";
+      this.emitChunkSegment(prefix, "user", delta, tracker);
+      return;
+    }
+    if (update.sessionUpdate === "agent_message_chunk") {
+      const delta = update.content.type === "text" ? (update.content.text ?? "") : "";
+      this.emitChunkSegment(prefix, "assistant", delta, tracker);
+      return;
+    }
+    if (update.sessionUpdate === "agent_thought_chunk") {
+      const delta = update.content.type === "text" ? (update.content.text ?? "") : "";
+      this.emitChunkSegment(prefix, "thought", delta, tracker);
+      return;
+    }
+    if (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update") {
+      resetTracker(tracker);
+      const snapshot = reduceToolCall(snapshots.get(update.toolCallId), update);
+      snapshots.set(update.toolCallId, snapshot);
+      const item = toToolTimelineItem(snapshot);
+      turnTools?.set(update.toolCallId, item);
+      this.emit({ type: "timeline.item", sessionId: this.boundarySessionId, item });
+      return;
+    }
+    if (update.sessionUpdate === "plan") {
+      resetTracker(tracker);
+      tracker.counter += 1;
+      this.emit({
+        type: "timeline.item",
+        sessionId: this.boundarySessionId,
+        item: {
+          type: "todo",
+          id: `${prefix}:plan:${tracker.counter}`,
+          items: planToTodoItems(update.entries),
         },
       });
     }
-    if (result.status === "ERROR") {
-      const canceled = result.error === "interrupted";
-      this.finishTools(turn, canceled ? "canceled" : "failed");
-      this.retire(driver);
-      this.emit({
-        type: "session.turn",
-        sessionId: this.options.id,
-        turnId: turn.id,
-        state: canceled ? "canceled" : "failed",
-        error: { message: diagnostic(result.error) },
-      });
-    } else {
-      this.finishTools(turn, "completed");
-      this.state = { type: "idle", driver };
-      this.emit({
-        type: "session.turn",
-        sessionId: this.options.id,
-        turnId: turn.id,
-        state: "completed",
-      });
-    }
   }
 
-  private acceptStep(step: Step, turn: Turn): void {
-    const id = `${turn.id}:${step.step_index}`;
-    if (step.step_type === "agent_response") {
-      const previous = turn.text.get(step.step_index) || "";
-      const text = previous + step.text_delta;
-      turn.text.set(step.step_index, text);
-      if (step.text_delta) this.item({ type: "assistant_message", id, messageId: id, text });
-      if (step.state === "DONE" && step.usage && !turn.usageSteps.has(step.step_index)) {
-        turn.usageSteps.add(step.step_index);
-        turn.usage.inputTokens += step.usage.input_tokens;
-        turn.usage.outputTokens += step.usage.output_tokens;
-        turn.usage.cachedInputTokens += step.usage.cache_read_tokens;
-        this.emit({
-          type: "session.usage",
-          sessionId: this.options.id,
-          turnId: turn.id,
-          usage: { ...turn.usage },
-        });
-      }
-    } else if (step.step_type === "tool" || step.step_type === "subagent") {
-      const item = toolItem(step, id);
-      turn.tools.set(id, item);
-      this.item(item);
-    }
-  }
-
-  private failTurn(error: AntigravityError): void {
-    const state = this.state;
-    if (state.type !== "running" && state.type !== "idle") return;
-    this.retire(state.driver);
-    if (state.type === "running") {
-      this.finishTools(state.turn, "failed");
-      this.emit({
-        type: "session.turn",
-        sessionId: this.options.id,
-        turnId: state.turn.id,
-        state: "failed",
-        error: { message: error.message, code: error.code },
-      });
-    } else
-      this.emit({
-        type: "session.runtime_failed",
-        sessionId: this.options.id,
-        error: { message: error.message, code: error.code },
-      });
-  }
-
-  private retire(driver: Driver): void {
-    this.state = { type: "stopping", driver };
-    void driver.stop("interrupt").then(() => {
-      if (this.state.type === "stopping" && this.state.driver === driver)
-        this.state = { type: "dormant" };
-      return undefined;
-    });
-  }
-
-  private finishTools(turn: Turn, status: "completed" | "failed" | "canceled"): void {
+  private finishTurnTools(turn: ActiveTurn, state: "completed" | "canceled" | "failed"): void {
     for (const item of turn.tools.values()) {
       if (item.status !== "running") continue;
-      if (status === "failed") this.item({ ...item, status, error: "Antigravity turn failed" });
-      else this.item({ ...item, status, error: null });
+      this.emit({
+        type: "timeline.item",
+        sessionId: this.boundarySessionId,
+        item:
+          state === "failed"
+            ? { ...item, status: "failed", error: { message: "Antigravity turn failed" } }
+            : { ...item, status: state, error: null },
+      });
     }
   }
 
-  private persistence(): ProviderPersistence {
-    if (this.conversationId === null) throw new AntigravityError("Antigravity has no conversation");
-    return { version: 1, data: { conversationId: this.conversationId } };
+  private cancelAllPermissions(): void {
+    for (const [permissionId, entry] of this.permissions) {
+      entry.incoming.reply({ outcome: { outcome: "cancelled" } });
+      this.emit({
+        type: "session.permission_resolved",
+        sessionId: this.boundarySessionId,
+        permissionId,
+      });
+    }
+    this.permissions.clear();
+  }
+
+  private async drainNotifications(): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await this.notificationQueue;
+  }
+
+  private async waitForInitialCommands(): Promise<void> {
+    if (this.commandsReceived) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        this.commandsWaiter = null;
+        resolve();
+      };
+      const timer = setTimeout(done, INITIAL_COMMANDS_WAIT_MS);
+      this.commandsWaiter = () => {
+        clearTimeout(timer);
+        done();
+      };
+    });
   }
 
   private publishConfig(): void {
     this.emit({
       type: "session.config",
-      sessionId: this.options.id,
-      config: {
-        model: this.config.model,
-        mode: this.config.mode || "full-access",
-        models: this.options.catalog().models,
-        modes: this.options.catalog().modes,
-        thinkingOptions: [],
-        settings: [],
-      },
+      sessionId: this.boundarySessionId,
+      config: toProviderConfigState(this.modes, this.configOptions),
     });
   }
-  private item(item: ProviderTimelineItem): void {
-    this.emit({ type: "timeline.item", sessionId: this.options.id, item });
-  }
+
   private emit(event: ProviderEvent): void {
     this.options.emit(event);
   }
-}
-
-// Native results contain every denial since this driver started, including repeated actions.
-function takeNewDenials(
-  actions: Extract<Frame, { event: "result" }>["result"]["denied_actions"],
-  reported: Map<string, number>,
-) {
-  const counts = new Map<string, number>();
-  const fresh = actions.filter((action) => {
-    const key = JSON.stringify([action.action, action.display_name]);
-    const count = (counts.get(key) ?? 0) + 1;
-    counts.set(key, count);
-    return count > (reported.get(key) ?? 0);
-  });
-  for (const [key, count] of counts) reported.set(key, Math.max(count, reported.get(key) ?? 0));
-  return fresh;
-}
-
-function denialNoticeTitle(
-  actions: Extract<Frame, { event: "result" }>["result"]["denied_actions"],
-): string {
-  if (actions.length > 1) return `${actions.length} actions denied`;
-  return actions[0].action === "command" ? "Shell command denied" : "Action denied";
 }

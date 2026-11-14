@@ -1,64 +1,70 @@
-import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import type { ProviderPrompt } from "@getpaseo/plugin/server/provider";
-import { AntigravityError } from "./wire.js";
+import type { ProviderContent, ProviderPrompt } from "@getpaseo/plugin/server/provider";
+import type { AcpContentBlock } from "./wire.js";
 
-interface EncodedPrompt {
-  text: string;
-  nativeText: string;
+export interface PromptCapabilities {
+  image: boolean;
 }
 
-export class PromptFiles {
-  private directory: string | null = null;
+export function encodePrompt(
+  prompt: ProviderPrompt,
+  capabilities: PromptCapabilities,
+): { blocks: AcpContentBlock[]; summaryText: string } {
+  if (prompt.input.type === "command") {
+    const suffix = prompt.input.arguments ? ` ${prompt.input.arguments}` : "";
+    const text = `/${prompt.input.name}${suffix}`;
+    return { blocks: [{ type: "text", text }], summaryText: text };
+  }
 
-  async encode(prompt: ProviderPrompt): Promise<EncodedPrompt> {
-    if (
-      prompt.input.type !== "message" ||
-      prompt.delivery === "steer" ||
-      prompt.outputSchema !== undefined
-    )
-      throw new AntigravityError("Antigravity supports messages only");
-    const parts = prompt.input.content.map((part) => {
-      if (part.type === "text") return part;
-      if (part.type === "image") return { ...part, extension: imageExtension(part.mimeType) };
-      throw new AntigravityError("Antigravity supports text and image content only");
-    });
-    const text: string[] = [];
-    const native: string[] = [];
-    for (const part of parts) {
-      if (part.type === "text") {
-        text.push(part.text);
-        native.push(part.text);
-      } else if (part.type === "image") {
-        const extension = part.extension;
-        if (this.directory === null) {
-          this.directory = await mkdtemp(path.join(os.tmpdir(), "paseo-antigravity-images-"));
-          await chmod(this.directory, 0o700);
-        }
-        const file = path.join(this.directory, `${randomUUID()}.${extension}`);
-        await writeFile(file, Buffer.from(part.data, "base64"), { flag: "wx", mode: 0o600 });
-        await chmod(file, 0o600);
-        native.push(`Attached image: ${file}`);
+  const blocks = prompt.input.content.map((part) => toAcpBlock(part, capabilities));
+  const summaryText = blocks
+    .filter((block): block is Extract<AcpContentBlock, { type: "text" }> => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+  return { blocks, summaryText };
+}
+
+function toAcpBlock(part: ProviderContent, capabilities: PromptCapabilities): AcpContentBlock {
+  switch (part.type) {
+    case "text": {
+      if ("title" in part && part.title) {
+        return { type: "text", text: `[${part.title}]\n${part.text}` };
       }
+      return { type: "text", text: part.text };
     }
-    return { text: text.join("\n"), nativeText: native.join("\n") };
-  }
-
-  async close(): Promise<void> {
-    if (this.directory !== null) {
-      await rm(this.directory, { recursive: true, force: true });
-      this.directory = null;
+    case "image":
+      if (capabilities.image) {
+        return { type: "image", data: part.data, mimeType: part.mimeType };
+      }
+      return { type: "text", text: `[Image attachment: ${part.mimeType}]` };
+    case "uploaded_file":
+      return {
+        type: "text",
+        text: `Attached file (${part.fileName}, ${part.mimeType}, ${part.size} bytes): ${part.path}`,
+      };
+    case "forge_change_request":
+    case "github_pr": {
+      const header = `Pull/Change Request #${part.number}: ${part.title}\nURL: ${part.url}`;
+      const branches =
+        part.baseRefName || part.headRefName
+          ? `\nBranch: ${part.headRefName ?? "?"} -> ${part.baseRefName ?? "?"}`
+          : "";
+      const body = part.body ? `\n\n${part.body}` : "";
+      return { type: "text", text: `${header}${branches}${body}` };
+    }
+    case "forge_issue":
+    case "github_issue": {
+      const body = part.body ? `\n\n${part.body}` : "";
+      return {
+        type: "text",
+        text: `Issue #${part.number}: ${part.title}\nURL: ${part.url}${body}`,
+      };
+    }
+    case "review": {
+      const lines = part.comments.map((comment) => {
+        const snippet = comment.context.lines.map((line) => line.content).join("\n");
+        return `${comment.filePath}:${comment.lineNumber} (${comment.side})\n${comment.context.hunkHeader}\n${snippet}\nComment: ${comment.body}`;
+      });
+      return { type: "text", text: lines.join("\n\n") };
     }
   }
-}
-
-function imageExtension(mimeType: string): string {
-  const match = /^image\/([a-z0-9][a-z0-9.+-]*)$/i.exec(mimeType);
-  if (!match) throw new AntigravityError(`Expected an image MIME type, received ${mimeType}`);
-  const subtype = match[1].toLowerCase();
-  if (subtype === "jpeg") return "jpg";
-  if (subtype === "svg+xml") return "svg";
-  return subtype;
 }
