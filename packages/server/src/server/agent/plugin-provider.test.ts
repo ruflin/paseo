@@ -2764,3 +2764,46 @@ test("plugin provider import launches with runtime MCP servers and returns only 
     await registry.shutdown();
   }
 });
+
+test("plugin provider exposes usageSession with merged launch env and clears on close", async () => {
+  const home = await mkdtemp(join(tmpdir(), "plugin-usage-session-"));
+  const logger = createTestLogger();
+  const storage = new AgentStorage(join(home, "agents"), logger);
+  const harness = createProviderHarness();
+  const registry = new PluginAgentClientRegistry(logger);
+  registry.replace([harness.registration]);
+  const client = registry.definitions()[harness.registration.id]!.createClient(logger, {
+    env: { AGY_HOME: "/custom/agy", FROM_RUNTIME: "1" },
+  });
+  const manager = new AgentManager({
+    clients: { [harness.registration.id]: client },
+    registry: storage,
+    logger,
+  });
+  try {
+    const agent = await manager.createAgent(
+      { provider: harness.registration.id, cwd: home },
+      undefined,
+      { workspaceId: undefined, env: { FROM_LAUNCH: "2" } },
+    );
+    const descriptor = manager.usageSession(agent.id);
+    expect(descriptor).toMatchObject({
+      provider: harness.registration.id,
+      model: "plugin-model",
+      sessionKey: expect.any(String),
+    });
+    expect(descriptor?.env).toMatchObject({
+      AGY_HOME: "/custom/agy",
+      FROM_RUNTIME: "1",
+      FROM_LAUNCH: "2",
+    });
+
+    await manager.closeAgent(agent.id);
+    expect(manager.usageSession(agent.id)).toBeNull();
+  } finally {
+    await Promise.all(manager.listAgents().map((item) => manager.closeAgent(item.id)));
+    await registry.shutdown();
+    await storage.flush();
+    await rm(home, { recursive: true, force: true });
+  }
+});

@@ -47,6 +47,7 @@ import type {
   AgentSlashCommand,
   AgentStreamEvent,
   AgentTimelineItem,
+  AgentUsageSession,
   FetchCatalogOptions,
   ImportableProviderSession,
   ImportedProviderSession,
@@ -957,6 +958,7 @@ interface PendingChild {
 class PluginAgentClient implements AgentClient {
   readonly provider: string;
   private readonly runtime: ProviderRuntime;
+  private readonly runtimeSettings?: ProviderRuntimeSettings;
   private readonly rootsBySession = new Map<string, PluginAgentSession>();
   private readonly pendingChildren: PendingChild[] = [];
 
@@ -964,6 +966,7 @@ class PluginAgentClient implements AgentClient {
 
   constructor(registration: ProviderRegistration, runtimeSettings?: ProviderRuntimeSettings) {
     this.provider = registration.id;
+    this.runtimeSettings = runtimeSettings;
     this.runtime = new ProviderRuntime(registration, runtimeSettings);
     if (registration.getCatalogCacheKey)
       this.getCatalogCacheKey = (options) => this.runtime.catalogCacheKey(options);
@@ -1113,6 +1116,10 @@ class PluginAgentClient implements AgentClient {
       this.attachPendingChildren();
     };
     const config = mapSessionConfig(input.config, input.launchContext, input.persist);
+    const harnessEnvironment = createProviderEnv({
+      runtimeSettings: this.runtimeSettings,
+      overlays: [input.launchContext?.env],
+    });
     const session = new PluginAgentSession(
       this.provider,
       bridge,
@@ -1135,6 +1142,7 @@ class PluginAgentClient implements AgentClient {
       },
       bind,
       config.settings,
+      harnessEnvironment,
     );
     bind(bridge);
     return session;
@@ -1214,6 +1222,7 @@ class PluginAgentSession implements AgentSession {
   /** While `applyOptions` waits on the plugin, its `session.config` answers that call. */
   private applyingOptions = false;
   private currentTurnId: string | null = null;
+  private readonly usageSessionKey = randomUUID();
   private closed = false;
   private replay: {
     persistence: ProviderPersistence;
@@ -1235,6 +1244,7 @@ class PluginAgentSession implements AgentSession {
     ) => Promise<ProviderRuntimeSession>,
     private readonly onBind: (bridge: ProviderRuntimeSession) => void,
     givenOptions: Readonly<Record<string, JsonValue>>,
+    private readonly harnessEnvironment: Record<string, string>,
   ) {
     this.subagentIdsBySession.set(bridge.id, null);
     // Every setting the session opened with that was not given, including ones nobody set.
@@ -1252,6 +1262,16 @@ class PluginAgentSession implements AgentSession {
 
   get id(): string {
     return this.describePersistence()?.sessionId ?? this.bridge.id;
+  }
+
+  usageSession(): AgentUsageSession | null {
+    if (this.closed) return null;
+    return {
+      provider: this.provider,
+      model: this.bridge.config.model,
+      env: this.harnessEnvironment,
+      sessionKey: this.usageSessionKey,
+    };
   }
 
   get capabilities(): AgentCapabilityFlags {
@@ -1931,13 +1951,17 @@ function mapModel(
   catalogDefaultThinkingOption: string | undefined,
 ): AgentModelDefinition {
   const thinkingOptions = model.thinkingOptions ?? catalogThinkingOptions;
+  const defaultThinkingOptionId =
+    model.thinkingOptions !== undefined
+      ? model.defaultThinkingOptionId
+      : (model.defaultThinkingOptionId ?? catalogDefaultThinkingOption);
   return {
     ...model,
     provider,
     isDefault: model.isDefault ?? model.id === defaultModel,
     metadata: model.metadata ? { ...model.metadata } : undefined,
     thinkingOptions: thinkingOptions?.map((option) => Object.assign({}, option)),
-    defaultThinkingOptionId: model.defaultThinkingOptionId ?? catalogDefaultThinkingOption,
+    defaultThinkingOptionId,
   };
 }
 

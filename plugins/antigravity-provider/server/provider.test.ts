@@ -9,6 +9,7 @@ import {
   type ProviderLaunch,
 } from "@getpaseo/plugin/server/provider";
 import { afterEach, describe, expect, it } from "vitest";
+import { antigravityToolTransformer } from "./internal/tools.js";
 import { createAntigravityProvider } from "./provider.js";
 
 const FAKE_AGY = new URL("../test/agy.mjs", import.meta.url).pathname;
@@ -308,6 +309,80 @@ describe("antigravity-provider (runAcpProvider)", () => {
           (entry) =>
             entry.method === "session/resume" &&
             (entry.params as { sessionId?: string }).sessionId === "legacy-conv-1",
+        ),
+      ).toBe(true);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("maps subagent tool metadata and legacy full-access mode, and formats mid-session auth errors", async () => {
+    const transformed = antigravityToolTransformer({
+      id: "sub-1",
+      name: "subagent",
+      title: "Run research",
+      status: "completed",
+      input: {},
+      output: {},
+      locations: [],
+      meta: {
+        subagent_info: {
+          subagents: [
+            {
+              type_name: "research",
+              initial_prompt: "Inspect repo",
+              conversation_id: "child-1",
+              log_uri: "/tmp/sub.log",
+            },
+          ],
+        },
+      },
+    });
+    expect(transformed.detail).toEqual({
+      type: "sub_agent",
+      subAgentType: "research",
+      description: "Inspect repo",
+      childSessionId: "child-1",
+      log: "/tmp/sub.log",
+    });
+    expect(transformed.metadata).toEqual({
+      subagents: [
+        {
+          type_name: "research",
+          initial_prompt: "Inspect repo",
+          conversation_id: "child-1",
+          log_uri: "/tmp/sub.log",
+        },
+      ],
+    });
+
+    const cwd = tempDir();
+    const logPath = tempLog();
+    const { connection, events } = await openHarness({ AGY_TEST_LOG: logPath });
+    try {
+      await connection.send({
+        type: "session.open",
+        requestId: "open-fa",
+        sessionId: "s-fa",
+        history: "skip",
+        config: { cwd, env: {}, mcpServers: {}, settings: {}, mode: "full-access", persist: true },
+      });
+      await waitFor(
+        events,
+        (e): e is Extract<ProviderEvent, { type: "session.ready" }> =>
+          e.type === "session.ready" && e.sessionId === "s-fa",
+        "open-fa",
+      );
+      const cfg = events.find(
+        (e): e is Extract<ProviderEvent, { type: "session.config" }> =>
+          e.type === "session.config" && e.sessionId === "s-fa",
+      );
+      expect(cfg?.config.mode).toBe("auto");
+      expect(
+        readLog(logPath).some(
+          (entry) =>
+            entry.method === "session/set_mode" &&
+            (entry.params as { modeId?: string }).modeId === "auto",
         ),
       ).toBe(true);
     } finally {

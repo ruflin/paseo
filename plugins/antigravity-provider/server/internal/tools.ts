@@ -176,41 +176,118 @@ function isEditTool(snapshot: AcpToolCallSnapshot, toolName: string): boolean {
   return snapshot.kind === "edit" || EDIT_TOOL_NAMES.has(toolName) || toolName.includes("edit");
 }
 
+const SUBAGENT_TOOL_NAMES = new Set(["subagent", "sub_agent", "invoke_subagent"]);
+
+function extractSubagentInfo(
+  input: Record<string, JsonValue>,
+  output: Record<string, JsonValue>,
+  meta: Record<string, JsonValue>,
+): { subagents: JsonValue[] | null; primary: Record<string, JsonValue> | null } {
+  const info = asRecord(meta.subagent_info ?? output.subagent_info ?? input.subagent_info);
+  const subagents = Array.isArray(info.subagents) ? info.subagents : null;
+  const primary = subagents && subagents.length > 0 ? asRecord(subagents[0]) : null;
+  return { subagents, primary };
+}
+
+function subagentDetail(
+  snapshot: AcpToolCallSnapshot,
+  input: Record<string, JsonValue>,
+  output: Record<string, JsonValue>,
+  meta: Record<string, JsonValue>,
+  contentText?: string,
+): {
+  detail: ProviderToolCallDetail;
+  metadata?: Readonly<Record<string, JsonValue>>;
+} | null {
+  const { subagents, primary } = extractSubagentInfo(input, output, meta);
+  const toolName = (snapshot.name ?? snapshot.title ?? "").toLowerCase();
+  if (!primary && !SUBAGENT_TOOL_NAMES.has(toolName)) return null;
+
+  const subAgentType = firstString(
+    primary?.type_name,
+    input.TypeName,
+    input.subagent_type,
+    input.type_name,
+    input.role,
+  );
+  const description = firstString(
+    primary?.initial_prompt,
+    input.Role,
+    input.description,
+    input.Prompt,
+    input.prompt,
+    snapshot.title,
+  );
+  const childSessionId = firstString(
+    primary?.conversation_id,
+    output.conversation_id,
+    output.conversationId,
+    output.childSessionId,
+  );
+  const log =
+    firstString(
+      primary?.log_uri,
+      output.log,
+      output.output,
+      contentText,
+      typeof snapshot.output === "string" ? snapshot.output : undefined,
+    ) ?? "";
+  return {
+    detail: {
+      type: "sub_agent",
+      ...(subAgentType ? { subAgentType } : {}),
+      ...(description ? { description } : {}),
+      ...(childSessionId ? { childSessionId } : {}),
+      log,
+    },
+    ...(subagents ? { metadata: { subagents } } : {}),
+  };
+}
+
 function resolveDetail(
   snapshot: AcpToolCallSnapshot,
   input: Record<string, JsonValue>,
   output: Record<string, JsonValue>,
+  meta: Record<string, JsonValue>,
   diff: { path: string; oldText?: string; newText: string } | undefined,
   contentText: string | undefined,
-): ProviderToolCallDetail | undefined {
+): { detail?: ProviderToolCallDetail; metadata?: Readonly<Record<string, JsonValue>> } {
+  const subagent = subagentDetail(snapshot, input, output, meta, contentText);
+  if (subagent) return subagent;
   const toolName = (snapshot.name ?? snapshot.title ?? "").toLowerCase();
   if (snapshot.kind === "execute" || toolName === "run_command" || toolName === "shell") {
-    return shellDetail(snapshot, input, output, contentText);
+    return { detail: shellDetail(snapshot, input, output, contentText) };
   }
   if (snapshot.kind === "read" || toolName === "read_file" || toolName === "view_file") {
-    return readDetail(snapshot, input, output, contentText);
+    return { detail: readDetail(snapshot, input, output, contentText) };
   }
   if (isWriteTool(snapshot, toolName, input, diff)) {
-    return writeDetail(snapshot, input, diff);
+    return { detail: writeDetail(snapshot, input, diff) };
   }
   if (isEditTool(snapshot, toolName)) {
-    return editDetail(snapshot, input, diff);
+    return { detail: editDetail(snapshot, input, diff) };
   }
   if (snapshot.kind === "search" || toolName === "grep_search" || toolName === "find_by_name") {
-    return searchDetail(toolName, snapshot, input, output, contentText);
+    return { detail: searchDetail(toolName, snapshot, input, output, contentText) };
   }
   if (snapshot.kind === "fetch" || toolName === "read_url_content") {
     const url = firstString(input.Url, input.url, snapshot.title) ?? "";
     const result = firstString(output.content, contentText);
-    return { type: "fetch", url, ...(result !== undefined ? { result } : {}) };
+    return { detail: { type: "fetch", url, ...(result !== undefined ? { result } : {}) } };
   }
-  return undefined;
+  return {};
 }
 
 export function antigravityToolTransformer(snapshot: AcpToolCallSnapshot): AcpToolCallSnapshot {
   const input = asRecord(snapshot.input);
   const output = asRecord(snapshot.output);
+  const meta = asRecord(snapshot.meta);
   const { diff, contentText } = extractDiffAndContentText(snapshot.content);
-  const detail = resolveDetail(snapshot, input, output, diff, contentText);
-  return detail ? { ...snapshot, detail } : snapshot;
+  const resolved = resolveDetail(snapshot, input, output, meta, diff, contentText);
+  if (!resolved.detail && !resolved.metadata) return snapshot;
+  return {
+    ...snapshot,
+    ...(resolved.detail ? { detail: resolved.detail } : {}),
+    ...(resolved.metadata ? { metadata: resolved.metadata } : {}),
+  };
 }

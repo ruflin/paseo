@@ -2220,4 +2220,270 @@ lines.on("line", (line) => {
       await connection.close();
     }
   });
+
+  it("supports clientCapabilityMeta, extMethod, config.setMode, vendor usage updates, tool _meta/metadata, formatError, and _meta.reasoningEfforts", async () => {
+    let seenClientMeta: unknown = null;
+    const probedModels: string[] = [];
+    let currentMode = "default";
+    const harness = connectorHarness({
+      handleRequest(instance, request) {
+        if (request.method === "initialize") {
+          seenClientMeta = (request.params as { clientCapabilities?: { _meta?: unknown } })
+            ?.clientCapabilities?._meta;
+          instance.respond(request, {
+            protocolVersion: 1,
+            agentCapabilities: { loadSession: true },
+          });
+          return true;
+        }
+        if (request.method === "session/new") {
+          instance.respond(request, {
+            sessionId: "native-flex",
+            modes: {
+              currentModeId: currentMode,
+              availableModes: [
+                { id: "default", name: "Default" },
+                { id: "auto", name: "Auto" },
+              ],
+            },
+            models: {
+              currentModelId: "m-meta",
+              availableModels: [
+                {
+                  modelId: "m-meta",
+                  name: "Meta Model",
+                  _meta: {
+                    reasoningEffort: "high",
+                    reasoningEfforts: [
+                      { id: "low", label: "Low" },
+                      { id: "high", label: "High" },
+                    ],
+                  },
+                },
+                {
+                  modelId: "m-no-think",
+                  name: "No Think",
+                  _meta: { supportsReasoningEffort: false },
+                },
+                { modelId: "m-probed", name: "Probed" },
+              ],
+            },
+            configOptions: [
+              {
+                id: "model",
+                name: "Model",
+                category: "model",
+                type: "select",
+                currentValue: "m-meta",
+                options: [
+                  { name: "Meta Model", value: "m-meta" },
+                  { name: "No Think", value: "m-no-think" },
+                  { name: "Probed", value: "m-probed" },
+                ],
+              },
+              {
+                id: "thought_level",
+                name: "Thinking",
+                category: "thought_level",
+                type: "select",
+                currentValue: "medium",
+                options: [
+                  { name: "Medium", value: "medium" },
+                  { name: "Max", value: "max" },
+                ],
+              },
+            ],
+          });
+          return true;
+        }
+        if (request.method === "session/set_config_option") {
+          const params = request.params as { configId?: string; value?: string };
+          if (params.configId === "model" && params.value) {
+            probedModels.push(params.value);
+          }
+          instance.respond(request, {
+            configOptions: [
+              {
+                id: "model",
+                name: "Model",
+                category: "model",
+                type: "select",
+                currentValue: params.value ?? "m-probed",
+                options: [
+                  { name: "Meta Model", value: "m-meta" },
+                  { name: "No Think", value: "m-no-think" },
+                  { name: "Probed", value: "m-probed" },
+                ],
+              },
+              {
+                id: "thought_level",
+                name: "Thinking",
+                category: "thought_level",
+                type: "select",
+                currentValue: "max",
+                options: [{ name: "Max", value: "max" }],
+              },
+            ],
+          });
+          return true;
+        }
+        if (request.method === "session/set_mode") {
+          const params = request.params as { modeId?: string };
+          currentMode = params.modeId ?? currentMode;
+          instance.respond(request, {});
+          return true;
+        }
+        if (request.method === "vendor/info") {
+          instance.respond(request, { ok: true, extra: "value" });
+          return true;
+        }
+        if (request.method === "session/prompt") {
+          instance.notify("vendor/usage", { used: 320, max: 1000 });
+          instance.notify("session/update", {
+            sessionId: "native-flex",
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "tc-meta",
+              title: "Subagent",
+              kind: "other",
+              status: "completed",
+              _meta: { subagent: { role: "researcher" } },
+            },
+          });
+          instance.reject(request, "authentication required");
+          return true;
+        }
+        return false;
+      },
+    });
+    let extResult: Record<string, unknown> | null = null;
+    const registration = runAcpProvider({
+      id: "flex-acp",
+      label: "Flex ACP",
+      connector: harness.connector,
+      acpOptions: {
+        discoverThinkingPerModel: true,
+        clientCapabilityMeta: { customFeature: true },
+      },
+      transformers: [
+        {
+          async discover(catalog, context) {
+            extResult = await context.extMethod("vendor/info", { ping: 1 });
+            return catalog;
+          },
+          async configure(change, context) {
+            if (change.target === "mode" && change.value === "full-access") {
+              await context.config.setMode("auto");
+              return "handled";
+            }
+            return "pass";
+          },
+          notification(notification) {
+            if (notification.method !== "vendor/usage") return null;
+            const params = notification.params as { used: number; max: number };
+            return {
+              type: "usage",
+              usage: {
+                contextWindowUsedTokens: params.used,
+                contextWindowMaxTokens: params.max,
+              },
+            };
+          },
+          toolCall(snapshot) {
+            if (snapshot.id !== "tc-meta") return snapshot;
+            return {
+              ...snapshot,
+              detail: { type: "sub_agent", subAgentType: "research", log: "" },
+              metadata: { rawMeta: snapshot.meta ?? null },
+            };
+          },
+          formatError(error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            return msg.includes("authentication required") ? `Formatted: ${msg}` : undefined;
+          },
+        },
+      ],
+    });
+    const connection = await registration.connect({
+      versions: [1],
+      capabilities: ["prompt.message", "session.configure"],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+
+    try {
+      expect(seenClientMeta).toEqual({ customFeature: true });
+      await connection.send({ type: "catalog", requestId: "cat-flex" });
+      const catalogEvent = await waitForEvent(
+        events,
+        (event): event is Extract<ProviderEvent, { type: "catalog" }> => event.type === "catalog",
+      );
+      expect(extResult).toEqual({ ok: true, extra: "value" });
+      expect(probedModels).toEqual(["m-probed"]);
+      expect(catalogEvent.catalog.models.find((m) => m.id === "m-meta")).toMatchObject({
+        thinkingOptions: [
+          { id: "low", label: "Low", isDefault: false },
+          { id: "high", label: "High", isDefault: true },
+        ],
+        defaultThinkingOptionId: "high",
+      });
+      expect(catalogEvent.catalog.models.find((m) => m.id === "m-no-think")).toMatchObject({
+        thinkingOptions: [],
+      });
+      expect(catalogEvent.catalog.models.find((m) => m.id === "m-probed")).toMatchObject({
+        thinkingOptions: [{ id: "max", label: "Max", isDefault: true }],
+      });
+
+      await connection.send({
+        type: "session.open",
+        requestId: "open-flex",
+        sessionId: "boundary-flex",
+        history: "skip",
+        config: {
+          cwd: "/repo",
+          env: {},
+          mcpServers: {},
+          settings: {},
+          mode: "full-access",
+          persist: true,
+        },
+      });
+      await waitForEvent(events, (event) => event.type === "session.ready");
+      expect(currentMode).toBe("auto");
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "boundary-flex",
+        prompt: {
+          clientMessageId: "p-flex",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "go" }] },
+        },
+      });
+      const failedTurn = await waitForEvent(
+        events,
+        (event): event is Extract<ProviderEvent, { type: "session.turn" }> =>
+          event.type === "session.turn" && event.state === "failed",
+      );
+      expect(failedTurn.error?.message).toContain("Formatted: authentication required");
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "session.usage",
+          usage: { contextWindowUsedTokens: 320, contextWindowMaxTokens: 1000 },
+        }),
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline.item",
+          item: expect.objectContaining({
+            type: "tool_call",
+            detail: { type: "sub_agent", subAgentType: "research", log: "" },
+            metadata: { rawMeta: { subagent: { role: "researcher" } } },
+          }),
+        }),
+      );
+    } finally {
+      await connection.close();
+    }
+  });
 });

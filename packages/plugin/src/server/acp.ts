@@ -9,6 +9,7 @@ import type {
   ProviderSessionConfig,
   ProviderTimelineItem,
   ProviderToolCallDetail,
+  ProviderUsage,
 } from "./provider.js";
 import { createAcpProviderConnection } from "./acp-internal/connection.js";
 
@@ -55,23 +56,32 @@ export interface AcpOptions {
   filterSessionsByCwd?: boolean;
   /** Probe selectable models during catalog discovery to capture model-specific thinking options. */
   discoverThinkingPerModel?: boolean;
+  /** Additional `_meta` entries advertised under `clientCapabilities` during ACP initialize. */
+  clientCapabilityMeta?: Record<string, JsonValue>;
 }
 
 export interface AcpContext {
   sessionId: string;
+  extMethod?(
+    method: string,
+    params?: Record<string, JsonValue>,
+  ): Promise<Record<string, JsonValue>>;
 }
 
 export interface AcpConfigAccess {
   read(): Promise<Readonly<Record<string, JsonValue>>>;
   set(id: string, value: JsonValue): Promise<void>;
+  setMode(modeId: string): Promise<void>;
 }
 
 export interface AcpDiscoveryContext extends AcpContext {
   config: AcpConfigAccess;
+  extMethod(method: string, params?: Record<string, JsonValue>): Promise<Record<string, JsonValue>>;
 }
 
 export interface AcpConfigureContext extends AcpContext {
   config: AcpConfigAccess;
+  extMethod(method: string, params?: Record<string, JsonValue>): Promise<Record<string, JsonValue>>;
 }
 
 export type AcpConfigChange =
@@ -90,14 +100,17 @@ export interface AcpToolCallSnapshot {
   output: JsonValue;
   locations: readonly string[];
   content?: JsonValue;
+  meta?: JsonValue;
   detail?: ProviderToolCallDetail;
+  metadata?: Readonly<Record<string, JsonValue>>;
 }
 
 export type AcpVendorUpdate =
   | { type: "commands"; commands: readonly ProviderCommand[] }
   | { type: "config"; config: ProviderConfigState }
   | { type: "timeline"; item: ProviderTimelineItem }
-  | { type: "notice"; notice: ProviderNotice };
+  | { type: "notice"; notice: ProviderNotice }
+  | { type: "usage"; usage: ProviderUsage; turnId?: string };
 
 export interface AcpTransformer {
   discover?(
@@ -114,6 +127,8 @@ export interface AcpTransformer {
   sessionMeta?(config: ProviderSessionConfig): Record<string, JsonValue> | undefined;
   /** Resolve an ACP session ID from legacy persistence records. */
   readPersistenceSessionId?(persistence: ProviderPersistence): string | null | undefined;
+  /** Customize user-facing error messages emitted for ACP requests, turns, and runtime failures. */
+  formatError?(error: unknown, context: AcpContext): string | undefined;
 }
 
 export function runAcpProvider(options: RunAcpProviderOptions): ProviderRegistration {

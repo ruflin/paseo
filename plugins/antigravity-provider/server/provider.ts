@@ -4,7 +4,7 @@ import type {
   ProviderPersistence,
   ProviderRegistration,
 } from "@getpaseo/plugin/server/provider";
-import { getCatalogCacheKey, getStatus } from "./internal/catalog.js";
+import { formatDiagnostic, getCatalogCacheKey, getStatus } from "./internal/catalog.js";
 import { antigravityToolTransformer } from "./internal/tools.js";
 
 function readLegacyConversationId(persistence: ProviderPersistence): string | null {
@@ -51,7 +51,16 @@ export function createAntigravityProvider(): ProviderRegistration {
             ? { antigravity: { systemPrompt: { append: config.systemPrompt } } }
             : undefined,
         readPersistenceSessionId: readLegacyConversationId,
+        configure: async (change, context) => {
+          if (change.target === "mode" && change.value === "full-access") {
+            await context.config.setMode("auto");
+            return "handled";
+          }
+          return "pass";
+        },
         toolCall: antigravityToolTransformer,
+        formatError: (error) =>
+          formatDiagnostic(error instanceof Error ? error.message : String(error)),
         discover: (catalog) => ({
           ...catalog,
           modes: catalog.modes.map(markUnattendedMode),

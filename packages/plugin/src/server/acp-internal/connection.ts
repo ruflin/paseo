@@ -1,3 +1,4 @@
+import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { spawnProcess, terminateProcess } from "../process.js";
 import { Readable, Writable } from "node:stream";
@@ -23,6 +24,7 @@ import { z } from "zod";
 import type {
   AcpConfigAccess,
   AcpConfigChange,
+  AcpContext,
   AcpToolCallSnapshot,
   AcpTransformer,
   AcpVendorUpdate,
@@ -123,7 +125,7 @@ export async function createAcpProviderConnection(
         return undefined;
       });
       const settled = operation.catch((error) => {
-        emitOperationFailure(input, emit, error);
+        emitOperationFailure(input, state, error);
       });
       inFlight.add(settled);
       void settled.finally(() => inFlight.delete(settled));
@@ -176,12 +178,17 @@ function validateAdmission(
 
 function emitOperationFailure(
   input: ProviderInput,
-  emit: (event: ProviderEvent) => void,
+  state: Pick<AcpConnectionState, "emit" | "options" | "sessions">,
   error: unknown,
 ): void {
-  const failure = { message: describeError(error) };
+  const sessionId = "sessionId" in input ? input.sessionId : input.type;
+  const session = "sessionId" in input ? state.sessions.get(input.sessionId) : undefined;
+  const message = session
+    ? session.runtime.formatError(error)
+    : formatTransformedError(state.options.transformers ?? [], error, { sessionId });
+  const failure = { message };
   if (input.type === "session.prompt") {
-    emit({
+    state.emit({
       type: "session.prompt_result",
       sessionId: input.sessionId,
       clientMessageId: input.prompt.clientMessageId,
@@ -190,11 +197,11 @@ function emitOperationFailure(
     return;
   }
   if ("requestId" in input) {
-    emit({ type: "request.failed", requestId: input.requestId, error: failure });
+    state.emit({ type: "request.failed", requestId: input.requestId, error: failure });
     return;
   }
   if ("sessionId" in input) {
-    emit({ type: "session.runtime_failed", sessionId: input.sessionId, error: failure });
+    state.emit({ type: "session.runtime_failed", sessionId: input.sessionId, error: failure });
   }
 }
 
@@ -260,10 +267,10 @@ async function discover(
   });
   try {
     let catalog = await runtime.discover(input.cwd);
-    const config = runtime.configAccess();
+    const context = runtime.discoveryContext();
     for (const transformer of state.options.transformers ?? []) {
       if (transformer.discover) {
-        catalog = await transformer.discover(catalog, { sessionId: "catalog", config });
+        catalog = await transformer.discover(catalog, context);
       }
     }
     state.emit({ type: "catalog", requestId: input.requestId, catalog });
@@ -384,6 +391,7 @@ class AcpRuntime {
   private readonly transformers: readonly AcpTransformer[];
   private configOptions: SessionConfigOption[] = [];
   private modes: NewSessionResponse["modes"] = null;
+  private modelsState: AcpModelState | null = null;
   private commandWaiter: (() => void) | null = null;
   private messageSequence = 0;
   /**
@@ -441,11 +449,12 @@ class AcpRuntime {
     }
     const runtime = new AcpRuntime(stream, child, closeConnector, options);
     try {
+      const clientCapabilityMeta = options.options.acpOptions?.clientCapabilityMeta;
       const initialize = withTimeout(
         runtime.call(
           runtime.connection.initialize({
             protocolVersion: PROTOCOL_VERSION,
-            clientCapabilities: {},
+            clientCapabilities: clientCapabilityMeta ? { _meta: clientCapabilityMeta } : {},
             clientInfo: { name: "paseo", version: "1" },
           }),
         ),
@@ -490,7 +499,7 @@ class AcpRuntime {
       this.emit({
         type: "session.runtime_failed",
         sessionId: this.options.boundarySessionId,
-        error: { message: describeError(error) },
+        error: { message: this.formatError(error) },
       });
     });
     child?.once("close", (code, signal) => {
@@ -500,9 +509,33 @@ class AcpRuntime {
       this.emit({
         type: "session.runtime_failed",
         sessionId: this.options.boundarySessionId,
-        error: { message: `ACP process exited (${signal ?? code ?? "unknown"})` },
+        error: { message: this.formatError(`ACP process exited (${signal ?? code ?? "unknown"})`) },
       });
     });
+  }
+
+  private acpContext(): AcpContext & {
+    extMethod(
+      method: string,
+      params?: Record<string, JsonValue>,
+    ): Promise<Record<string, JsonValue>>;
+  } {
+    return {
+      sessionId: this.options.boundarySessionId,
+      extMethod: async (method, params = {}) =>
+        jsonRecord(await this.call(this.connection.extMethod(method, params))),
+    };
+  }
+
+  discoveryContext() {
+    return {
+      ...this.acpContext(),
+      config: this.configAccess(),
+    };
+  }
+
+  formatError(error: unknown): string {
+    return formatTransformedError(this.transformers, error, this.acpContext());
   }
 
   private resolveNativeSessionId(persistence: ProviderPersistence | undefined): string | null {
@@ -581,6 +614,7 @@ class AcpRuntime {
       this.nativeSessionId = newSession.sessionId;
     }
     this.modes = response.modes;
+    this.modelsState = parseModelState(response);
     this.configOptions = response.configOptions ?? [];
     await this.applyInitialConfig(input.config);
     const sessionCapabilities = connectionCapabilities.filter(
@@ -617,19 +651,32 @@ class AcpRuntime {
     );
     this.nativeSessionId = response.sessionId;
     this.modes = response.modes;
+    this.modelsState = parseModelState(response);
     this.configOptions = response.configOptions ?? [];
     const thinkingByModel = this.options.options.acpOptions?.discoverThinkingPerModel
-      ? await this.probeThinkingByModel(this.configOptions)
+      ? await this.probeThinkingByModel(this.configOptions, this.modelsState)
       : undefined;
-    return toProviderCatalog(response.modes, response.configOptions ?? [], thinkingByModel);
+    return toProviderCatalog(
+      response.modes,
+      response.configOptions ?? [],
+      this.modelsState,
+      thinkingByModel,
+    );
   }
 
   private async probeThinkingByModel(
     initialOptions: readonly SessionConfigOption[],
+    modelsState: AcpModelState | null,
   ): Promise<Map<string, { options: ProviderThinkingOption[]; defaultId?: string }>> {
     const result = new Map<string, { options: ProviderThinkingOption[]; defaultId?: string }>();
     const model = modelOption(initialOptions);
     if (!model || model.type === "boolean") return result;
+
+    const modelsWithReasoningMeta = new Set(
+      (modelsState?.availableModels ?? [])
+        .filter((candidate) => hasModelReasoningMetadata(candidate._meta))
+        .map((candidate) => candidate.modelId),
+    );
 
     const recordThinking = (options: readonly SessionConfigOption[], modelId: string) => {
       const thinking = options.find((opt) => opt.category === "thought_level");
@@ -643,9 +690,12 @@ class AcpRuntime {
         result.set(modelId, { options: choices, defaultId: thinking.currentValue });
     };
 
-    recordThinking(initialOptions, model.currentValue);
+    if (!modelsWithReasoningMeta.has(model.currentValue)) {
+      recordThinking(initialOptions, model.currentValue);
+    }
     for (const candidate of selectOptions(model)) {
       if (candidate.value === model.currentValue) continue;
+      if (modelsWithReasoningMeta.has(candidate.value)) continue;
       try {
         const updated = await this.call(
           this.connection.setSessionConfigOption({
@@ -745,7 +795,7 @@ class AcpRuntime {
           sessionId: this.options.boundarySessionId,
           turnId,
           state: "failed",
-          error: { message: describeError(error) },
+          error: { message: this.formatError(error) },
         });
         return undefined;
       },
@@ -815,7 +865,8 @@ class AcpRuntime {
     try {
       for (const change of ordered) await this.applyConfigChange(change);
       committedConfig =
-        this.stagedTransformerConfig ?? toProviderConfigState(this.modes, this.configOptions);
+        this.stagedTransformerConfig ??
+        toProviderConfigState(this.modes, this.configOptions, this.modelsState);
     } catch (error) {
       try {
         await this.restoreConfig(previousModes, previousOptions);
@@ -827,7 +878,7 @@ class AcpRuntime {
         this.emit({
           type: "session.runtime_failed",
           sessionId: this.options.boundarySessionId,
-          error: { message: describeError(failure) },
+          error: { message: this.formatError(failure) },
         });
         await this.close();
         throw failure;
@@ -904,12 +955,26 @@ class AcpRuntime {
     return this.configOptions.find((option) => option.category === "mode")?.id;
   }
 
+  private async applyMode(modeId: string): Promise<void> {
+    if (!modeId || !this.modes) {
+      throw new Error("ACP session does not expose mode configuration");
+    }
+    await this.call(
+      this.connection.setSessionMode({
+        sessionId: this.nativeSessionId,
+        modeId,
+      }),
+    );
+    this.modes = { ...this.modes, currentModeId: modeId };
+  }
+
   private async applyConfigChange(change: AcpConfigChange): Promise<void> {
     const access = this.configAccess();
+    const context = this.acpContext();
     for (const transformer of this.transformers) {
       if (
         (await transformer.configure?.(change, {
-          sessionId: this.options.boundarySessionId,
+          ...context,
           config: access,
         })) === "handled"
       ) {
@@ -917,16 +982,10 @@ class AcpRuntime {
       }
     }
     if (change.target === "mode") {
-      if (!change.value || !this.modes) {
+      if (!change.value) {
         throw new Error("ACP session does not expose mode configuration");
       }
-      await this.call(
-        this.connection.setSessionMode({
-          sessionId: this.nativeSessionId,
-          modeId: change.value,
-        }),
-      );
-      this.modes = { ...this.modes, currentModeId: change.value };
+      await this.applyMode(change.value);
       return;
     }
     const configId = this.configIdFor(change);
@@ -964,12 +1023,17 @@ class AcpRuntime {
         );
         this.configOptions = response.configOptions;
       },
+      setMode: async (modeId) => {
+        await this.applyMode(modeId);
+      },
     };
   }
 
   private emitConfig(): void {
     if (this.configTransaction) return;
-    this.emitConfigSnapshot(toProviderConfigState(this.modes, this.configOptions));
+    this.emitConfigSnapshot(
+      toProviderConfigState(this.modes, this.configOptions, this.modelsState),
+    );
   }
 
   private emitConfigSnapshot(config: ProviderConfigState): void {
@@ -1009,7 +1073,7 @@ class AcpRuntime {
   private requestPermission(request: RequestPermissionRequest): Promise<RequestPermissionResponse> {
     const permissionId = `permission:${request.toolCall.toolCallId}`;
     let snapshot = mergeToolCallSnapshot(request.toolCall, undefined);
-    const context = { sessionId: this.options.boundarySessionId };
+    const context = this.acpContext();
     for (const transformer of this.transformers) {
       snapshot = transformer.toolCall?.(snapshot, context) ?? snapshot;
     }
@@ -1238,7 +1302,7 @@ class AcpRuntime {
   private reduceToolCall(update: ToolCall | ToolCallUpdate): void {
     const current = this.toolCalls.get(update.toolCallId);
     let snapshot = mergeToolCallSnapshot(update, current);
-    const context = { sessionId: this.options.boundarySessionId };
+    const context = this.acpContext();
     for (const transformer of this.transformers)
       snapshot = transformer.toolCall?.(snapshot, context) ?? snapshot;
     this.toolCalls.set(snapshot.id, snapshot);
@@ -1251,7 +1315,7 @@ class AcpRuntime {
 
   private vendorNotification(method: string, params: unknown): void {
     const notification = { method, params: jsonValue(params) };
-    const context = { sessionId: this.options.boundarySessionId };
+    const context = this.acpContext();
     for (const transformer of this.transformers) {
       const transformed = transformer.notification?.(notification, context);
       if (!transformed) continue;
@@ -1279,6 +1343,14 @@ class AcpRuntime {
         type: "timeline.item",
         sessionId: this.options.boundarySessionId,
         item: update.item,
+      });
+    } else if (update.type === "usage") {
+      this.lastUsage = { ...this.lastUsage, ...update.usage };
+      this.emit({
+        type: "session.usage",
+        sessionId: this.options.boundarySessionId,
+        ...(update.turnId ? { turnId: update.turnId } : {}),
+        usage: this.lastUsage,
       });
     } else {
       this.emit({
@@ -1442,6 +1514,7 @@ function mergeToolCallSnapshot(
     output: jsonValue(firstDefined(update.rawOutput, current?.output, null)),
     locations: update.locations?.map((location) => location.path) ?? current?.locations ?? [],
     content: update.content !== undefined ? jsonValue(update.content) : current?.content,
+    meta: update._meta !== undefined ? jsonValue(update._meta) : current?.meta,
   };
 }
 
@@ -1500,17 +1573,111 @@ function readNativeSessionId(persistence: ProviderPersistence | undefined): stri
   return typeof persistence.data.sessionId === "string" ? persistence.data.sessionId : null;
 }
 
+const AcpModelStateSchema = z.object({
+  currentModelId: z.string().optional(),
+  availableModels: z.array(
+    z.object({
+      modelId: z.string(),
+      name: z.string(),
+      description: z.string().nullish(),
+      _meta: z.record(z.string(), z.unknown()).nullish(),
+    }),
+  ),
+});
+type AcpModelState = z.infer<typeof AcpModelStateSchema>;
+
+function parseModelState(response: unknown): AcpModelState | null {
+  if (typeof response !== "object" || response === null || !("models" in response)) return null;
+  const parsed = AcpModelStateSchema.safeParse((response as { models?: unknown }).models);
+  return parsed.success ? parsed.data : null;
+}
+
+const ACPModelReasoningSchema = z.object({
+  supportsReasoningEffort: z.boolean().optional(),
+  reasoningEffort: z.string().min(1).nullish(),
+  reasoningEfforts: z
+    .array(
+      z.object({
+        id: z.string().min(1),
+        value: z.string().min(1).optional(),
+        label: z.string(),
+        description: z.string().nullish(),
+        default: z.boolean().optional(),
+      }),
+    )
+    .optional(),
+});
+
+function hasModelReasoningMetadata(metadata: Record<string, unknown> | null | undefined): boolean {
+  const parsed = ACPModelReasoningSchema.safeParse(metadata ?? {});
+  if (!parsed.success) return false;
+  return (
+    parsed.data.supportsReasoningEffort === false || parsed.data.reasoningEfforts !== undefined
+  );
+}
+
+function deriveModelThinking(input: {
+  metadata: Record<string, unknown> | null | undefined;
+  isDefault: boolean;
+  fallback: { options: readonly ProviderThinkingOption[]; defaultId?: string };
+}): { options: ProviderThinkingOption[]; defaultId?: string } {
+  const parsed = ACPModelReasoningSchema.safeParse(input.metadata ?? {});
+  if (!parsed.success)
+    return { options: [...input.fallback.options], defaultId: input.fallback.defaultId };
+  const { supportsReasoningEffort, reasoningEffort, reasoningEfforts } = parsed.data;
+  if (supportsReasoningEffort === false || reasoningEfforts?.length === 0) {
+    return { options: [] };
+  }
+  if (!reasoningEfforts) {
+    return { options: [...input.fallback.options], defaultId: input.fallback.defaultId };
+  }
+  const ids = reasoningEfforts.map((effort) => effort.value ?? effort.id);
+  if (new Set(ids).size !== ids.length) {
+    return { options: [...input.fallback.options], defaultId: input.fallback.defaultId };
+  }
+  const markedDefault = reasoningEfforts.find((effort) => effort.default);
+  const defaultCandidates = [
+    input.isDefault ? input.fallback.defaultId : undefined,
+    reasoningEffort,
+    markedDefault ? (markedDefault.value ?? markedDefault.id) : undefined,
+  ];
+  const defaultId = defaultCandidates.find((id) => id && ids.includes(id)) ?? undefined;
+  return {
+    options: reasoningEfforts.map((effort, index) => {
+      const option: ProviderThinkingOption = {
+        id: ids[index],
+        label: effort.label,
+        isDefault: ids[index] === defaultId,
+      };
+      if (effort.description) option.description = effort.description;
+      return option;
+    }),
+    defaultId,
+  };
+}
+
 function toProviderConfigState(
   modes: NewSessionResponse["modes"],
   options: readonly SessionConfigOption[],
+  modelsState: AcpModelState | null = null,
 ): ProviderConfigState {
   const model = modelOption(options);
   const thinking = options.find((option) => option.category === "thought_level");
+  const configModels = selectOptions(model).map((option) => ({
+    id: option.value,
+    label: option.label,
+  }));
+  const fallbackModels =
+    modelsState?.availableModels.map((candidate) => ({
+      id: candidate.modelId,
+      label: candidate.name,
+      ...(candidate.description ? { description: candidate.description } : {}),
+    })) ?? [];
   return {
-    model: selectedValue(model),
+    model: selectedValue(model) ?? modelsState?.currentModelId ?? undefined,
     mode: modes?.currentModeId,
     thinkingOption: selectedValue(thinking),
-    models: selectOptions(model).map((option) => ({ id: option.value, label: option.label })),
+    models: configModels.length > 0 ? configModels : fallbackModels,
     modes:
       modes?.availableModes.map((mode) => ({
         id: mode.id,
@@ -1542,22 +1709,40 @@ function modelOption(options: readonly SessionConfigOption[]): SessionConfigOpti
 function toProviderCatalog(
   modes: NewSessionResponse["modes"],
   options: readonly SessionConfigOption[],
+  modelsState: AcpModelState | null = null,
   thinkingByModel?: ReadonlyMap<string, { options: ProviderThinkingOption[]; defaultId?: string }>,
 ): ProviderCatalog {
-  const state = toProviderConfigState(modes, options);
-  const models: ProviderModel[] = thinkingByModel
-    ? state.models.map((model) => {
-        const entry: ProviderModel = { id: model.id, label: model.label };
-        if (model.description) entry.description = model.description;
-        if (model.id === state.model) entry.isDefault = true;
-        const perModel = thinkingByModel.get(model.id);
-        if (perModel && perModel.options.length > 0) {
-          entry.thinkingOptions = perModel.options;
-          entry.defaultThinkingOptionId = perModel.defaultId;
-        }
-        return entry;
-      })
-    : [...state.models];
+  const state = toProviderConfigState(modes, options, modelsState);
+  const metaByModelId = new Map(
+    (modelsState?.availableModels ?? []).map((candidate) => [candidate.modelId, candidate._meta]),
+  );
+  const sessionFallback = {
+    options: state.thinkingOptions,
+    defaultId: state.thinkingOption,
+  };
+  const models: ProviderModel[] = state.models.map((model) => {
+    const entry: ProviderModel = { id: model.id, label: model.label };
+    if (model.description) entry.description = model.description;
+    if (model.id === state.model) entry.isDefault = true;
+    const modelMeta = metaByModelId.get(model.id);
+    const probed = thinkingByModel?.get(model.id);
+    const fallback = probed && probed.options.length > 0 ? probed : sessionFallback;
+    if (hasModelReasoningMetadata(modelMeta)) {
+      const derived = deriveModelThinking({
+        metadata: modelMeta,
+        isDefault: Boolean(entry.isDefault),
+        fallback,
+      });
+      entry.thinkingOptions = derived.options;
+      if (derived.defaultId !== undefined) {
+        entry.defaultThinkingOptionId = derived.defaultId;
+      }
+    } else if (probed && probed.options.length > 0) {
+      entry.thinkingOptions = probed.options;
+      entry.defaultThinkingOptionId = probed.defaultId;
+    }
+    return entry;
+  });
   return {
     models,
     modes: state.modes,
@@ -1635,6 +1820,7 @@ function toolTimelineItem(snapshot: AcpToolCallSnapshot): ToolCallTimelineItem {
     callId: snapshot.id,
     name: snapshot.name ?? snapshot.title,
     detail,
+    ...(snapshot.metadata ? { metadata: snapshot.metadata } : {}),
   };
   if (status === "failed") {
     return { ...base, status, error: snapshot.output ?? { message: "Tool failed" } };
@@ -1666,6 +1852,18 @@ function jsonRecord(value: unknown): Record<string, ReturnType<typeof jsonValue>
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function formatTransformedError(
+  transformers: readonly AcpTransformer[],
+  error: unknown,
+  context: AcpContext,
+): string {
+  for (const transformer of transformers) {
+    const formatted = transformer.formatError?.(error, context);
+    if (typeof formatted === "string" && formatted.length > 0) return formatted;
+  }
+  return describeError(error);
 }
 
 function withTimeout<Value>(
