@@ -419,12 +419,14 @@ class AcpRuntime {
   private promptLane: Promise<void> = Promise.resolve();
   private activePrompt: { turnId: string; settled: Promise<void> } | null = null;
   private lastUsage: ProviderUsage = {};
+  private stderr = "";
 
   static async start(options: StartRuntimeOptions): Promise<AcpRuntime> {
     let child: ChildProcessWithoutNullStreams | null = null;
     let spawnFailure: Promise<never> | null = null;
     let stream: Stream;
     let closeConnector = async () => {};
+    let stderrBuffer = "";
     if (options.options.command) {
       // COMPAT(pluginProviderLaunch): added in v0.10.0, remove after 2027-03-29 once plugin host floor >= v0.10.0.
       // Standalone callers and older hosts do not send a daemon-resolved launch.
@@ -438,7 +440,10 @@ class AcpRuntime {
         stdio: "pipe",
       });
       spawnFailure = new Promise<never>((_resolve, reject) => child!.once("error", reject));
-      child.stderr.on("data", () => undefined);
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderrBuffer = (stderrBuffer + chunk.toString()).slice(-8192);
+        if (runtimeRef) runtimeRef.stderr = stderrBuffer;
+      });
       const output = Writable.toWeb(child.stdin) as unknown as Parameters<typeof ndJsonStream>[0];
       const input = Readable.toWeb(child.stdout) as unknown as Parameters<typeof ndJsonStream>[1];
       stream = ndJsonStream(output, input);
@@ -447,7 +452,10 @@ class AcpRuntime {
       stream = owned.stream;
       closeConnector = owned.close;
     }
+    let runtimeRef: AcpRuntime | null = null;
     const runtime = new AcpRuntime(stream, child, closeConnector, options);
+    runtime.stderr = stderrBuffer;
+    runtimeRef = runtime;
     try {
       const clientCapabilityMeta = options.options.acpOptions?.clientCapabilityMeta;
       const initialize = withTimeout(
@@ -506,10 +514,12 @@ class AcpRuntime {
       if (this.closing || this.processFailed || !this.nativeSessionId) return;
       this.processFailed = true;
       this.settlePendingWork();
+      const detail = this.stderr.trim();
+      const reason = `ACP process exited (${signal ?? code ?? "unknown"})${detail ? `: ${detail}` : ""}`;
       this.emit({
         type: "session.runtime_failed",
         sessionId: this.options.boundarySessionId,
-        error: { message: this.formatError(`ACP process exited (${signal ?? code ?? "unknown"})`) },
+        error: { message: this.formatError(reason) },
       });
     });
   }
@@ -538,15 +548,6 @@ class AcpRuntime {
     return formatTransformedError(this.transformers, error, this.acpContext());
   }
 
-  private resolveNativeSessionId(persistence: ProviderPersistence | undefined): string | null {
-    if (!persistence) return null;
-    for (const transformer of this.transformers) {
-      const resolved = transformer.readPersistenceSessionId?.(persistence);
-      if (typeof resolved === "string" && resolved.length > 0) return resolved;
-    }
-    return readNativeSessionId(persistence);
-  }
-
   private buildSessionMetadata(config: ProviderSessionConfig): Record<string, unknown> {
     const metadata: Record<string, unknown> = {
       _paseo: {
@@ -568,7 +569,7 @@ class AcpRuntime {
     connectionCapabilities: readonly ProviderCapability[],
   ): Promise<readonly ProviderCapability[]> {
     const mcpServers = toAcpMcpServers(input.config);
-    const nativeSessionId = this.resolveNativeSessionId(input.persistence);
+    const nativeSessionId = readNativeSessionId(input.persistence);
     const metadata = this.buildSessionMetadata(input.config);
     let response: Pick<NewSessionResponse, "modes" | "configOptions">;
     if (nativeSessionId) {
@@ -680,14 +681,16 @@ class AcpRuntime {
 
     const recordThinking = (options: readonly SessionConfigOption[], modelId: string) => {
       const thinking = options.find((opt) => opt.category === "thought_level");
-      if (!thinking || thinking.type === "boolean") return;
+      if (!thinking || thinking.type === "boolean") {
+        result.set(modelId, { options: [] });
+        return;
+      }
       const choices: ProviderThinkingOption[] = selectOptions(thinking).map((choice) => {
         const option: ProviderThinkingOption = { id: choice.value, label: choice.label };
         if (choice.value === thinking.currentValue) option.isDefault = true;
         return option;
       });
-      if (choices.length > 0)
-        result.set(modelId, { options: choices, defaultId: thinking.currentValue });
+      result.set(modelId, { options: choices, defaultId: thinking.currentValue });
     };
 
     if (!modelsWithReasoningMeta.has(model.currentValue)) {
@@ -990,9 +993,11 @@ class AcpRuntime {
     }
     const configId = this.configIdFor(change);
     if (!configId) {
+      if (change.target === "thinking") return;
       throw new Error(`ACP session does not expose ${change.target} configuration`);
     }
     if (change.value === null) {
+      if (change.target === "thinking") return;
       throw new Error(`ACP configuration ${configId} cannot be cleared`);
     }
     const response = await this.call(
@@ -1368,7 +1373,8 @@ class AcpRuntime {
     return Promise.race([
       operation,
       this.connection.closed.then(() => {
-        throw new Error("ACP transport closed unexpectedly");
+        const detail = this.stderr.trim();
+        throw new Error(`ACP transport closed unexpectedly${detail ? `: ${detail}` : ""}`);
       }),
     ]);
   }
@@ -1737,19 +1743,21 @@ function toProviderCatalog(
       if (derived.defaultId !== undefined) {
         entry.defaultThinkingOptionId = derived.defaultId;
       }
-    } else if (probed && probed.options.length > 0) {
+    } else if (probed !== undefined) {
       entry.thinkingOptions = probed.options;
-      entry.defaultThinkingOptionId = probed.defaultId;
+      if (probed.defaultId !== undefined) {
+        entry.defaultThinkingOptionId = probed.defaultId;
+      }
     }
     return entry;
   });
   return {
     models,
     modes: state.modes,
-    thinkingOptions: state.thinkingOptions,
+    thinkingOptions: thinkingByModel ? undefined : state.thinkingOptions,
     defaultModel: state.model,
     defaultMode: state.mode,
-    defaultThinkingOption: state.thinkingOption,
+    defaultThinkingOption: thinkingByModel ? undefined : state.thinkingOption,
   };
 }
 

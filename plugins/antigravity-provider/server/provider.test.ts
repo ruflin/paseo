@@ -120,7 +120,7 @@ describe("antigravity-provider (runAcpProvider)", () => {
     expect(authStatus?.diagnostic).toContain("Run 'agy' to sign in");
   });
 
-  it("computes workspace and environment aware catalog cache keys", async () => {
+  it("computes host and environment aware catalog cache keys without leaking env values", async () => {
     const provider = createAntigravityProvider();
     const kGlobal = await provider.getCatalogCacheKey?.({ scope: "global", launch: testLaunch() });
     const kWsA = await provider.getCatalogCacheKey?.({
@@ -133,8 +133,14 @@ describe("antigravity-provider (runAcpProvider)", () => {
       cwd: "/repo-b",
       launch: testLaunch(),
     });
-    expect(kGlobal).not.toBe(kWsA);
-    expect(kWsA).not.toBe(kWsB);
+    const kOtherEnv = await provider.getCatalogCacheKey?.({
+      scope: "global",
+      launch: testLaunch({ AGY_HOME: "/custom/agy" }),
+    });
+    expect(kGlobal).toBeDefined();
+    expect(kGlobal).toBe(kWsA);
+    expect(kWsA).toBe(kWsB);
+    expect(kOtherEnv).not.toBe(kGlobal);
   });
 
   it("discovers catalog with per-model thinking options, marks auto unattended, and closes probe session", async () => {
@@ -149,7 +155,11 @@ describe("antigravity-provider (runAcpProvider)", () => {
           e.type === "catalog" && e.requestId === "cat-1",
         "cat-1",
       );
-      expect(ev.catalog.models.map((m) => m.id)).toEqual(["gemini-4-argon", "gemini-4-hydrogen"]);
+      expect(ev.catalog.models.map((m) => m.id)).toEqual([
+        "gemini-4-argon",
+        "gemini-4-hydrogen",
+        "gemini-pro-orchestrator-g1-pro",
+      ]);
       const hydrogen = ev.catalog.models.find((m) => m.id === "gemini-4-hydrogen");
       expect(hydrogen?.thinkingOptions?.map((t) => t.id)).toEqual([
         "low",
@@ -157,6 +167,8 @@ describe("antigravity-provider (runAcpProvider)", () => {
         "high",
         "xhigh",
       ]);
+      const orchestrator = ev.catalog.models.find((m) => m.id === "gemini-pro-orchestrator-g1-pro");
+      expect(orchestrator?.thinkingOptions).toEqual([]);
       expect(ev.catalog.modes.find((m) => m.id === "auto")?.isUnattended).toBe(true);
       expect(ev.catalog.modes.find((m) => m.id === "default")?.isUnattended).toBe(false);
 
@@ -289,34 +301,12 @@ describe("antigravity-provider (runAcpProvider)", () => {
         oldString: "a = 1",
         newString: "a = 2",
       });
-
-      await connection.send({
-        type: "session.open",
-        requestId: "open-legacy",
-        sessionId: "s-legacy",
-        history: "skip",
-        persistence: { version: 1, data: { conversationId: "legacy-conv-1" } },
-        config: { cwd, env: {}, mcpServers: {}, settings: {}, persist: true },
-      });
-      await waitFor(
-        events,
-        (e): e is Extract<ProviderEvent, { type: "session.ready" }> =>
-          e.type === "session.ready" && e.sessionId === "s-legacy",
-        "open-legacy",
-      );
-      expect(
-        readLog(logPath).some(
-          (entry) =>
-            entry.method === "session/resume" &&
-            (entry.params as { sessionId?: string }).sessionId === "legacy-conv-1",
-        ),
-      ).toBe(true);
     } finally {
       await connection.close();
     }
   });
 
-  it("maps subagent tool metadata and legacy full-access mode, and formats mid-session auth errors", async () => {
+  it("maps subagent tool metadata and formats mid-session auth errors", async () => {
     const transformed = antigravityToolTransformer({
       id: "sub-1",
       name: "subagent",
@@ -357,34 +347,36 @@ describe("antigravity-provider (runAcpProvider)", () => {
     });
 
     const cwd = tempDir();
-    const logPath = tempLog();
-    const { connection, events } = await openHarness({ AGY_TEST_LOG: logPath });
+    const { connection, events } = await openHarness();
     try {
       await connection.send({
         type: "session.open",
-        requestId: "open-fa",
-        sessionId: "s-fa",
+        requestId: "open-auth",
+        sessionId: "s-auth",
         history: "skip",
-        config: { cwd, env: {}, mcpServers: {}, settings: {}, mode: "full-access", persist: true },
+        config: { cwd, env: {}, mcpServers: {}, settings: {}, persist: true },
       });
       await waitFor(
         events,
         (e): e is Extract<ProviderEvent, { type: "session.ready" }> =>
-          e.type === "session.ready" && e.sessionId === "s-fa",
-        "open-fa",
+          e.type === "session.ready" && e.sessionId === "s-auth",
+        "open-auth",
       );
-      const cfg = events.find(
-        (e): e is Extract<ProviderEvent, { type: "session.config" }> =>
-          e.type === "session.config" && e.sessionId === "s-fa",
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s-auth",
+        prompt: {
+          clientMessageId: "m-auth",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "AUTH_ERR" }] },
+        },
+      });
+      const failedTurn = await waitFor(
+        events,
+        (e): e is Extract<ProviderEvent, { type: "session.turn" }> =>
+          e.type === "session.turn" && e.sessionId === "s-auth" && e.state === "failed",
       );
-      expect(cfg?.config.mode).toBe("auto");
-      expect(
-        readLog(logPath).some(
-          (entry) =>
-            entry.method === "session/set_mode" &&
-            (entry.params as { modeId?: string }).modeId === "auto",
-        ),
-      ).toBe(true);
+      expect(failedTurn.error?.message).toContain("Run 'agy' to sign in");
     } finally {
       await connection.close();
     }

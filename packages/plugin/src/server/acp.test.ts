@@ -2028,7 +2028,7 @@ function configOptions() {
     { value: "high", name: "High" },
   ];
   if (currentModel === "model-b") thinking.push({ value: "xhigh", name: "Extra" });
-  return [
+  const options = [
     {
       id: "model",
       name: "Model",
@@ -2038,17 +2038,21 @@ function configOptions() {
       options: [
         { value: "model-a", name: "Model A" },
         { value: "model-b", name: "Model B" },
+        { value: "model-no-think", name: "Model No Think" },
       ],
     },
-    {
+  ];
+  if (currentModel !== "model-no-think") {
+    options.push({
       id: "thought_level",
       name: "Thought Level",
       category: "thought_level",
       type: "select",
       currentValue: "low",
       options: thinking,
-    },
-  ];
+    });
+  }
+  return options;
 }
 lines.on("line", (line) => {
   const msg = JSON.parse(line);
@@ -2125,17 +2129,6 @@ lines.on("line", (line) => {
               : undefined;
             return config.systemPrompt ? { vendor: { append: config.systemPrompt } } : undefined;
           },
-          readPersistenceSessionId(persistence) {
-            if (
-              persistence.data &&
-              typeof persistence.data === "object" &&
-              !Array.isArray(persistence.data) &&
-              typeof persistence.data.conversationId === "string"
-            ) {
-              return persistence.data.conversationId;
-            }
-            return null;
-          },
           toolCall(snapshot) {
             if (snapshot.kind === "execute") {
               seenMethods.push(snapshot.id);
@@ -2165,6 +2158,9 @@ lines.on("line", (line) => {
       );
       const modelB = catalogEvent.catalog.models.find((m) => m.id === "model-b");
       expect(modelB?.thinkingOptions?.map((o) => o.id)).toEqual(["low", "high", "xhigh"]);
+      const modelNoThink = catalogEvent.catalog.models.find((m) => m.id === "model-no-think");
+      expect(modelNoThink?.thinkingOptions).toEqual([]);
+      expect(catalogEvent.catalog.thinkingOptions).toBeUndefined();
 
       await connection.send({ type: "sessions", requestId: "list-1", cwd: "/repo-a" });
       const listEvent = await waitForEvent(
@@ -2178,7 +2174,7 @@ lines.on("line", (line) => {
         requestId: "open-1",
         sessionId: "boundary-1",
         history: "skip",
-        persistence: { version: 1, data: { conversationId: "legacy-123" } },
+        persistence: { version: 1, data: { sessionId: "legacy-123" } },
         config: {
           cwd: "/repo-a",
           env: {},
@@ -2196,6 +2192,27 @@ lines.on("line", (line) => {
       expect(opened.persistence).toEqual({ version: 1, data: { sessionId: "legacy-123" } });
       expect(seenMeta).toEqual({ vendor: { append: "Append me" } });
       await waitForEvent(events, (event) => event.type === "session.ready");
+
+      await connection.send({
+        type: "session.configure",
+        requestId: "cfg-no-think",
+        sessionId: "boundary-1",
+        changes: { model: "model-no-think", thinkingOption: "high" },
+      });
+      await waitForEvent(
+        events,
+        (event) => event.type === "request.completed" && event.requestId === "cfg-no-think",
+      );
+      await connection.send({
+        type: "session.configure",
+        requestId: "cfg-clear-think",
+        sessionId: "boundary-1",
+        changes: { model: "model-a", thinkingOption: null },
+      });
+      await waitForEvent(
+        events,
+        (event) => event.type === "request.completed" && event.requestId === "cfg-clear-think",
+      );
 
       await connection.send({
         type: "session.prompt",

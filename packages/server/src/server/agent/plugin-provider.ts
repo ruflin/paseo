@@ -1951,6 +1951,10 @@ function mapModel(
   catalogDefaultThinkingOption: string | undefined,
 ): AgentModelDefinition {
   const thinkingOptions = model.thinkingOptions ?? catalogThinkingOptions;
+  const normalizedThinkingOptions =
+    thinkingOptions && thinkingOptions.length > 0
+      ? thinkingOptions.map((option) => Object.assign({}, option))
+      : undefined;
   const defaultThinkingOptionId =
     model.thinkingOptions !== undefined
       ? model.defaultThinkingOptionId
@@ -1960,7 +1964,7 @@ function mapModel(
     provider,
     isDefault: model.isDefault ?? model.id === defaultModel,
     metadata: model.metadata ? { ...model.metadata } : undefined,
-    thinkingOptions: thinkingOptions?.map((option) => Object.assign({}, option)),
+    thinkingOptions: normalizedThinkingOptions,
     defaultThinkingOptionId,
   };
 }

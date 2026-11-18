@@ -130,9 +130,22 @@ test("Antigravity creates an agent and answers a prompt with real agy", async ({
     // Snapshot reads start discovery again; await one refresh before checking readiness.
     await client.refreshProvidersSnapshot({ cwd, providers: ["antigravity"] });
     const snapshot = await client.getProvidersSnapshot({ cwd });
-    expect(snapshot.entries.find((entry) => entry.provider === "antigravity")?.status).toBe(
-      "ready",
-    );
+    const antigravityEntry = snapshot.entries.find((entry) => entry.provider === "antigravity");
+    expect(antigravityEntry?.status).toBe("ready");
+    expect(
+      antigravityEntry?.models
+        .find((m) => m.id === "gemini-4-argon")
+        ?.thinkingOptions?.map((o) => o.id),
+    ).toEqual(["low", "medium", "high"]);
+    expect(
+      antigravityEntry?.models
+        .find((m) => m.id === "gemini-4-hydrogen")
+        ?.thinkingOptions?.map((o) => o.id),
+    ).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(
+      antigravityEntry?.models.find((m) => m.id === "gemini-pro-orchestrator-g1-pro")
+        ?.thinkingOptions,
+    ).toBeUndefined();
     const agent = await client.createAgent({
       provider: "antigravity",
       cwd,

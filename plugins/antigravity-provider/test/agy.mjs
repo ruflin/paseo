@@ -53,7 +53,7 @@ function buildConfigOptions() {
   if (!thinkingChoices.some((choice) => choice.value === currentThinking)) {
     currentThinking = "medium";
   }
-  return [
+  const options = [
     {
       id: "model",
       name: "Model",
@@ -63,30 +63,34 @@ function buildConfigOptions() {
       options: [
         { value: "gemini-4-argon", name: "Gemini 4 Argon" },
         { value: "gemini-4-hydrogen", name: "Gemini 4 Hydrogen" },
+        { value: "gemini-pro-orchestrator-g1-pro", name: "Orchestrator (Argon)" },
       ],
     },
-    {
+  ];
+  if (currentModel !== "gemini-pro-orchestrator-g1-pro") {
+    options.push({
       id: "thought_level",
       name: "Thought Level",
       category: "thought_level",
       type: "select",
       currentValue: currentThinking,
       options: thinkingChoices,
-    },
-    {
-      id: "mode",
-      name: "Mode",
-      category: "mode",
-      type: "select",
-      currentValue: currentMode,
-      options: [
-        { value: "default", name: "Default" },
-        { value: "accept-edits", name: "Accept Edits" },
-        { value: "auto", name: "Auto" },
-        { value: "plan", name: "Plan" },
-      ],
-    },
-  ];
+    });
+  }
+  options.push({
+    id: "mode",
+    name: "Mode",
+    category: "mode",
+    type: "select",
+    currentValue: currentMode,
+    options: [
+      { value: "default", name: "Default" },
+      { value: "accept-edits", name: "Accept Edits" },
+      { value: "auto", name: "Auto" },
+      { value: "plan", name: "Plan" },
+    ],
+  });
+  return options;
 }
 
 function buildModes() {
@@ -114,6 +118,11 @@ async function handlePrompt(id, params) {
   const imageBlock = promptBlocks.find((b) => b.type === "image");
 
   updateSession({ sessionUpdate: "user_message_chunk", content: { type: "text", text } });
+
+  if (text.includes("AUTH_ERR")) {
+    send({ jsonrpc: "2.0", id, error: { code: -32000, message: "Authentication required" } });
+    return;
+  }
 
   if (text.includes("HANG")) {
     updateSession({

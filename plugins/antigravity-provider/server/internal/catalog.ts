@@ -1,13 +1,12 @@
-import { homedir } from "node:os";
-import { createInterface } from "node:readline";
-import { spawnProcess } from "@getpaseo/plugin/server";
+import { createHash } from "node:crypto";
+import { execCommand } from "@getpaseo/plugin/server";
 import type {
   ProviderCatalogOptions,
   ProviderLaunch,
+  ProviderRegistration,
   ProviderStatus,
   ProviderStatusRequest,
 } from "@getpaseo/plugin/server/provider";
-import { signalProcess } from "./signals.js";
 
 const MIN_AGY_VERSION = "1.5.0";
 const STATUS_TIMEOUT_MS = 10_000;
@@ -50,26 +49,21 @@ export async function getCatalogCacheKey(options: ProviderCatalogOptions): Promi
   for (const [key, value] of Object.entries(launch.env).sort(([a], [b]) => a.localeCompare(b))) {
     if (key.startsWith("AGY_")) envEntries.push([key, value]);
   }
-  return JSON.stringify({
-    scope: options.scope,
-    cwd: options.scope === "workspace" ? options.cwd : null,
-    command: launch.command,
-    args: launch.args,
-    env: envEntries,
-  });
+  return createHash("sha256")
+    .update(JSON.stringify([launch.command, launch.args, envEntries]))
+    .digest("hex");
 }
 
-export async function getStatus(request: ProviderStatusRequest): Promise<ProviderStatus> {
+export async function getStatus(
+  request: ProviderStatusRequest,
+  connect: ProviderRegistration["connect"],
+): Promise<ProviderStatus> {
   const launch = defaultLaunch(request.launch);
   let version: string;
   try {
     version = await probeVersion(launch);
   } catch (error) {
-    return {
-      available: false,
-      diagnostic:
-        error instanceof Error ? formatDiagnostic(error.message) : formatDiagnostic(String(error)),
-    };
+    return { available: false, diagnostic: formatDiagnostic(extractErrorText(error)) };
   }
   if (!isVersionAtLeast(version, MIN_AGY_VERSION)) {
     return {
@@ -77,115 +71,34 @@ export async function getStatus(request: ProviderStatusRequest): Promise<Provide
       diagnostic: `Antigravity CLI ${MIN_AGY_VERSION} or newer is required for ACP support (found ${version || "unknown"}). Update Antigravity CLI to use this provider.`,
     };
   }
+  let connection: Awaited<ReturnType<ProviderRegistration["connect"]>> | null = null;
   try {
-    await probeAcpInitialize(launch);
+    connection = await connect({ versions: [1], capabilities: [], launch });
     return { available: true };
   } catch (error) {
-    return {
-      available: false,
-      diagnostic:
-        error instanceof Error ? formatDiagnostic(error.message) : formatDiagnostic(String(error)),
-    };
+    return { available: false, diagnostic: formatDiagnostic(extractErrorText(error)) };
+  } finally {
+    await connection?.close().catch(() => undefined);
   }
 }
 
-function probeVersion(launch: ProviderLaunch): Promise<string> {
+async function probeVersion(launch: ProviderLaunch): Promise<string> {
   const baseArgs =
     launch.args[launch.args.length - 1] === "acp" ? launch.args.slice(0, -1) : launch.args;
-  return new Promise((resolve, reject) => {
-    const child = spawnProcess(launch.command, [...baseArgs, "--version"], {
-      env: launch.env,
-      stdio: "pipe",
-      detached: process.platform !== "win32",
-    });
-    let stdout = "";
-    let stderr = "";
-    const deadline = setTimeout(() => {
-      void Promise.resolve(killChild(child.pid)).then(() => {
-        reject(new Error("Antigravity version check timed out"));
-        return undefined;
-      }, reject);
-    }, STATUS_TIMEOUT_MS);
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr = (stderr + chunk.toString()).slice(-8192);
-    });
-    child.on("error", (error: Error) => {
-      clearTimeout(deadline);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(deadline);
-      if (code === 0) resolve(stdout.trim());
-      else reject(new Error(stderr.trim() || `agy exited with code ${code}`));
-    });
+  const { stdout } = await execCommand(launch.command, [...baseArgs, "--version"], {
+    env: launch.env,
+    timeout: STATUS_TIMEOUT_MS,
+    maxBuffer: 64_000,
   });
+  return stdout.trim();
 }
 
-function probeAcpInitialize(launch: ProviderLaunch): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const child = spawnProcess(launch.command, launch.args, {
-      cwd: homedir(),
-      env: launch.env,
-      stdio: "pipe",
-      detached: process.platform !== "win32",
-    });
-    let settled = false;
-    let stderr = "";
-    const finish = (err?: Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(deadline);
-      child.stdin.end();
-      void killChild(child.pid);
-      if (err) reject(err);
-      else resolve();
-    };
-    const deadline = setTimeout(
-      () => finish(new Error(stderr.trim() || "Antigravity ACP initialization timed out")),
-      STATUS_TIMEOUT_MS,
-    );
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr = (stderr + chunk.toString()).slice(-8192);
-    });
-    child.on("error", (error: Error) => finish(error));
-    child.on("close", (code) => {
-      if (!settled) {
-        finish(new Error(stderr.trim() || `Antigravity ACP exited with code ${code}`));
-      }
-    });
-    const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    rl.on("line", (line) => {
-      if (!line.trim()) return;
-      try {
-        const msg = JSON.parse(line) as {
-          id?: number;
-          error?: { message?: string };
-          result?: unknown;
-        };
-        if (msg.id !== 1) return;
-        if (msg.error) finish(new Error(msg.error.message || JSON.stringify(msg.error)));
-        else finish();
-      } catch {
-        // Ignore non-JSON lines before JSON-RPC response.
-      }
-    });
-    child.stdin.write(
-      `${JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: { protocolVersion: 1, clientCapabilities: {} },
-      })}\n`,
-    );
-  });
-}
-
-function killChild(pid: number | undefined): void | Promise<void> {
-  if (!pid) return;
-  return signalProcess({ platform: process.platform, pid, signal: "SIGKILL" });
+function extractErrorText(error: unknown): string {
+  if (typeof error === "object" && error !== null && "stderr" in error) {
+    const stderr = (error as { stderr?: unknown }).stderr;
+    if (typeof stderr === "string" && stderr.trim().length > 0) return stderr.trim();
+  }
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isVersionAtLeast(actual: string, minimum: string): boolean {

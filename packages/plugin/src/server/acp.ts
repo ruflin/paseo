@@ -4,7 +4,6 @@ import type {
   ProviderCommand,
   ProviderConfigState,
   ProviderNotice,
-  ProviderPersistence,
   ProviderRegistration,
   ProviderSessionConfig,
   ProviderTimelineItem,
@@ -125,8 +124,6 @@ export interface AcpTransformer {
   toolCall?(toolCall: AcpToolCallSnapshot, context: AcpContext): AcpToolCallSnapshot;
   /** Additional top-level `_meta` entries merged alongside `_paseo` on session creation/load/resume. */
   sessionMeta?(config: ProviderSessionConfig): Record<string, JsonValue> | undefined;
-  /** Resolve an ACP session ID from legacy persistence records. */
-  readPersistenceSessionId?(persistence: ProviderPersistence): string | null | undefined;
   /** Customize user-facing error messages emitted for ACP requests, turns, and runtime failures. */
   formatError?(error: unknown, context: AcpContext): string | undefined;
 }

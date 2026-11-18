@@ -1,35 +1,7 @@
 import { runAcpProvider } from "@getpaseo/plugin/server/acp";
-import type {
-  ProviderMode,
-  ProviderPersistence,
-  ProviderRegistration,
-} from "@getpaseo/plugin/server/provider";
+import type { ProviderRegistration } from "@getpaseo/plugin/server/provider";
 import { formatDiagnostic, getCatalogCacheKey, getStatus } from "./internal/catalog.js";
 import { antigravityToolTransformer } from "./internal/tools.js";
-
-function readLegacyConversationId(persistence: ProviderPersistence): string | null {
-  if (
-    typeof persistence.data !== "object" ||
-    persistence.data === null ||
-    Array.isArray(persistence.data)
-  ) {
-    return null;
-  }
-  const conversationId = (persistence.data as Record<string, unknown>).conversationId;
-  return typeof conversationId === "string" && conversationId.length > 0 ? conversationId : null;
-}
-
-function markUnattendedMode(mode: ProviderMode): ProviderMode {
-  const updated: ProviderMode = {
-    id: mode.id,
-    label: mode.label,
-    isUnattended: mode.id === "auto" || mode.id === "full-access",
-  };
-  if (mode.description) updated.description = mode.description;
-  if (mode.icon) updated.icon = mode.icon;
-  if (mode.colorTier) updated.colorTier = mode.colorTier;
-  return updated;
-}
 
 export function createAntigravityProvider(): ProviderRegistration {
   const acp = runAcpProvider({
@@ -50,20 +22,15 @@ export function createAntigravityProvider(): ProviderRegistration {
           config.systemPrompt
             ? { antigravity: { systemPrompt: { append: config.systemPrompt } } }
             : undefined,
-        readPersistenceSessionId: readLegacyConversationId,
-        configure: async (change, context) => {
-          if (change.target === "mode" && change.value === "full-access") {
-            await context.config.setMode("auto");
-            return "handled";
-          }
-          return "pass";
-        },
         toolCall: antigravityToolTransformer,
         formatError: (error) =>
           formatDiagnostic(error instanceof Error ? error.message : String(error)),
         discover: (catalog) => ({
           ...catalog,
-          modes: catalog.modes.map(markUnattendedMode),
+          modes: catalog.modes.map((mode) => ({
+            ...mode,
+            isUnattended: mode.id === "auto",
+          })),
         }),
       },
     ],
@@ -71,7 +38,7 @@ export function createAntigravityProvider(): ProviderRegistration {
 
   return {
     ...acp,
-    status: getStatus,
+    status: (request) => getStatus(request, acp.connect),
     getCatalogCacheKey,
   };
 }
