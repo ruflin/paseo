@@ -8423,6 +8423,151 @@ test("project.rename.request returns accepted=false when project is not found", 
   expect(response?.payload.error).toBeTruthy();
 });
 
+test("project.default_model.set.request stores defaultModel and emits project and workspace updates", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = asTestSession(
+    createSessionForWorkspaceTests({ onMessage: (message) => emitted.push(message) }),
+  );
+  session.updateClientCapabilities({ [CLIENT_CAPS.projectUpdates]: true });
+
+  const project = createPersistedProjectRecord({
+    projectId: "prj_default_model",
+    projectKey: "remote:github.com/acme/repo",
+    rootPath: REPO_CWD,
+    kind: "git",
+    displayName: "acme/repo",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-default-model",
+    projectId: project.projectId,
+    cwd: REPO_CWD,
+    kind: "local_checkout",
+    displayName: "main",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+
+  const projects = new Map([[project.projectId, project]]);
+  session.projectRegistry.get = async (id: string) => projects.get(id) ?? null;
+  session.projectRegistry.list = async () => Array.from(projects.values());
+  session.projectRegistry.upsert = async (record: unknown) => {
+    const parsed = record as typeof project;
+    projects.set(parsed.projectId, parsed);
+  };
+  session.workspaceRegistry.listAll = session.workspaceRegistry.listActive = async () => [
+    workspace,
+  ];
+  session.workspaceRegistry.get = async (id: string) =>
+    id === workspace.workspaceId ? workspace : null;
+
+  await session.handleMessage({
+    type: "fetch_workspaces_request",
+    requestId: "sub-workspaces",
+    subscribe: { subscriptionId: "sub-workspaces" },
+  });
+
+  await session.handleMessage({
+    type: "project.default_model.set.request",
+    projectId: project.projectId,
+    defaultModel: { provider: " claude ", model: " claude-opus-4-6 " },
+    requestId: "req-default-model-1",
+  });
+
+  expect(findByType(emitted, "project.default_model.set.response")?.payload).toEqual({
+    requestId: "req-default-model-1",
+    projectId: project.projectId,
+    accepted: true,
+    defaultModel: { provider: "claude", model: "claude-opus-4-6" },
+    error: null,
+  });
+  expect(projects.get(project.projectId)?.defaultModel).toEqual({
+    provider: "claude",
+    model: "claude-opus-4-6",
+  });
+  expect(findByType(emitted, "project.update")?.payload).toMatchObject({
+    kind: "upsert",
+    project: {
+      projectId: project.projectId,
+      defaultModel: { provider: "claude", model: "claude-opus-4-6" },
+    },
+  });
+  expect(findByType(emitted, "workspace_update")?.payload).toMatchObject({
+    kind: "upsert",
+    workspace: {
+      id: "ws-default-model",
+      projectDefaultModel: { provider: "claude", model: "claude-opus-4-6" },
+    },
+  });
+
+  emitted.length = 0;
+  await session.handleMessage({
+    type: "project.default_model.set.request",
+    projectId: project.projectId,
+    defaultModel: null,
+    requestId: "req-default-model-clear",
+  });
+
+  expect(findByType(emitted, "project.default_model.set.response")?.payload).toEqual({
+    requestId: "req-default-model-clear",
+    projectId: project.projectId,
+    accepted: true,
+    defaultModel: null,
+    error: null,
+  });
+  expect(projects.get(project.projectId)?.defaultModel).toBeNull();
+});
+
+test("project.default_model.set.request rejects missing projects and blank providers", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const session = asTestSession(
+    createSessionForWorkspaceTests({ onMessage: (message) => emitted.push(message) }),
+  );
+  session.projectRegistry.get = async () => null;
+
+  await session.handleMessage({
+    type: "project.default_model.set.request",
+    projectId: "does-not-exist",
+    defaultModel: { provider: "claude", model: "claude-opus-4-6" },
+    requestId: "req-default-model-missing",
+  });
+
+  expect(findByType(emitted, "project.default_model.set.response")?.payload).toEqual({
+    requestId: "req-default-model-missing",
+    projectId: "does-not-exist",
+    accepted: false,
+    defaultModel: null,
+    error: "Project not found",
+  });
+
+  emitted.length = 0;
+  const project = createPersistedProjectRecord({
+    projectId: "prj_blank_provider",
+    rootPath: REPO_CWD,
+    kind: "git",
+    displayName: "repo",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  session.projectRegistry.get = async () => project;
+
+  await session.handleMessage({
+    type: "project.default_model.set.request",
+    projectId: project.projectId,
+    defaultModel: { provider: "   ", model: "claude-opus-4-6" },
+    requestId: "req-default-model-blank",
+  });
+
+  expect(findByType(emitted, "project.default_model.set.response")?.payload).toEqual({
+    requestId: "req-default-model-blank",
+    projectId: project.projectId,
+    accepted: false,
+    defaultModel: null,
+    error: "Provider is required",
+  });
+});
+
 test("workspace.title.set.request stores the title and emits an updated descriptor", async () => {
   const emitted: SessionOutboundMessage[] = [];
   const session = asTestSession(

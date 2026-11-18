@@ -37,6 +37,7 @@ import type {
 } from "@getpaseo/protocol/agent-types";
 import type {
   ServerInfoStatusPayload,
+  ProjectDefaultModel,
   ProjectPlacementPayload,
   ServerCapabilities,
   WorkspaceDescriptorPayload,
@@ -121,6 +122,7 @@ export interface WorkspaceDescriptor {
   projectDisplayName: string;
   projectCustomName?: string | null;
   projectCustomIconRevision?: string | null;
+  projectDefaultModel?: ProjectDefaultModel | null;
   projectRootPath: string;
   workspaceDirectory: string;
   worktreeSlug?: WorkspaceDescriptorPayload["worktreeSlug"];
@@ -161,6 +163,7 @@ export function normalizeWorkspaceDescriptor(
     projectDisplayName: payload.projectDisplayName,
     projectCustomName: payload.projectCustomName ?? null,
     projectCustomIconRevision: payload.projectCustomIconRevision ?? null,
+    projectDefaultModel: payload.projectDefaultModel ?? null,
     projectRootPath: payload.projectRootPath,
     // Canonicalize the workspace directory once, at the store boundary, so every
     // consumer can read workspace.workspaceDirectory directly. Empty means "no
@@ -198,6 +201,7 @@ export interface ProjectDescriptor {
   projectCustomName: string | null;
   projectCustomIconRevision?: string | null;
   projectIconRevision?: string;
+  defaultModel?: ProjectDefaultModel | null;
   projectRootPath: string;
   projectKind: WorkspaceDescriptorPayload["projectKind"];
 }
@@ -212,6 +216,7 @@ export function normalizeProjectDescriptor(
     projectCustomName: payload.projectCustomName ?? null,
     projectCustomIconRevision: payload.projectCustomIconRevision ?? null,
     projectIconRevision: payload.projectIconRevision,
+    defaultModel: payload.defaultModel ?? null,
     projectRootPath: payload.projectRootPath,
     projectKind: payload.projectKind,
   };

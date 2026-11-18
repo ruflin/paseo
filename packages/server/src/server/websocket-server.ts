@@ -2238,6 +2238,8 @@ export class VoiceAssistantWebSocketServer {
         agentProfiles: true,
         // COMPAT(agentConfigApply): added in v0.3.2, remove gate after 2027-02-11.
         agentConfigApply: true,
+        // COMPAT(projectDefaultModel): added in v0.16.2, remove gate after 2027-05-18.
+        projectDefaultModel: true,
       },
     };
   }

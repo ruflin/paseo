@@ -1047,6 +1047,7 @@ function legacyProjectDescriptorFromWorkspace(workspace: WorkspaceDescriptor): P
     projectKey: null,
     projectDisplayName: workspace.projectDisplayName,
     projectCustomName: workspace.projectCustomName ?? null,
+    defaultModel: workspace.projectDefaultModel ?? null,
     projectRootPath: workspace.projectRootPath,
     projectKind: workspace.projectKind,
   };

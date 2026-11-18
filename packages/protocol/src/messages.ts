@@ -1056,11 +1056,23 @@ export const ProjectIconSourceSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("upload"), data: z.string() }),
 ]);
 
+export const ProjectDefaultModelSchema = z.object({
+  provider: z.string(),
+  model: z.string().nullable().optional(),
+});
+
 export const ProjectRenameRequestSchema = z.object({
   type: z.literal("project.rename.request"),
   projectId: z.string(),
   // Null or empty string clears the override and reverts to the derived name.
   customName: z.string().nullable(),
+  requestId: z.string(),
+});
+
+export const ProjectDefaultModelSetRequestSchema = z.object({
+  type: z.literal("project.default_model.set.request"),
+  projectId: z.string(),
+  defaultModel: ProjectDefaultModelSchema.nullable(),
   requestId: z.string(),
 });
 
@@ -2264,6 +2276,19 @@ export const ProjectRenameResponsePayloadSchema = z.object({
 export const ProjectRenameResponseSchema = z.object({
   type: z.literal("project.rename.response"),
   payload: ProjectRenameResponsePayloadSchema,
+});
+
+export const ProjectDefaultModelSetResponsePayloadSchema = z.object({
+  requestId: z.string(),
+  projectId: z.string(),
+  accepted: z.boolean(),
+  defaultModel: ProjectDefaultModelSchema.nullable(),
+  error: z.string().nullable(),
+});
+
+export const ProjectDefaultModelSetResponseSchema = z.object({
+  type: z.literal("project.default_model.set.response"),
+  payload: ProjectDefaultModelSetResponsePayloadSchema,
 });
 
 export const ProjectIconSetResponseSchema = z.object({
@@ -3543,6 +3568,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   CloseItemsRequestMessageSchema,
   UpdateAgentRequestMessageSchema,
   ProjectRenameRequestSchema,
+  ProjectDefaultModelSetRequestSchema,
   ProjectIconSetRequestSchema,
   ProjectRemoveRequestSchema,
   WorkspaceTitleSetRequestSchema,
@@ -4142,6 +4168,8 @@ export const ServerInfoStatusPayloadSchema = z
         agentProfiles: z.boolean().optional(),
         // COMPAT(agentConfigApply): added in v0.3.2, remove gate after 2027-02-11.
         agentConfigApply: z.boolean().optional(),
+        // COMPAT(projectDefaultModel): added in v0.16.2, remove gate after 2027-05-18.
+        projectDefaultModel: z.boolean().optional(),
       })
       .optional(),
   })
@@ -4444,6 +4472,8 @@ export const WorkspaceDescriptorPayloadSchema = z
     // Identifies the project's stored custom icon; null means automatic.
     // COMPAT(projectCustomIcon): added in v0.2.0, remove after 2027-01-20.
     projectCustomIconRevision: z.string().nullable().optional(),
+    // COMPAT(projectDefaultModel): added in v0.16.2, remove after 2027-05-18.
+    projectDefaultModel: ProjectDefaultModelSchema.nullable().optional(),
     projectRootPath: z.string(),
     workspaceDirectory: z.string().optional(),
     // COMPAT(workspaceSetupObservation): added in v0.12.0, remove optional after 2027-04-19.
@@ -4648,6 +4678,8 @@ export const WorkspaceProjectDescriptorPayloadSchema = z.object({
   // absence of an icon. Clients may persist icon results against this value.
   // COMPAT(projectIconCache): added in v0.2.7, remove optional after 2027-02-12.
   projectIconRevision: z.string().optional(),
+  // COMPAT(projectDefaultModel): added in v0.16.2, remove after 2027-05-18.
+  defaultModel: ProjectDefaultModelSchema.nullable().optional(),
   projectRootPath: z.string(),
   projectKind: z.enum(["git", "non_git", "directory"]),
   // COMPAT(directorySync): sequence of this latest directory projection.
@@ -7554,6 +7586,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   AgentRewindResponseMessageSchema,
   UpdateAgentResponseMessageSchema,
   ProjectRenameResponseSchema,
+  ProjectDefaultModelSetResponseSchema,
   ProjectIconSetResponseSchema,
   ProjectRemoveResponseSchema,
   WorkspaceTitleSetResponseSchema,
@@ -7763,7 +7796,13 @@ export type AgentConfigApplyResponseMessage = z.infer<typeof AgentConfigApplyRes
 export type AgentDetachResponseMessage = z.infer<typeof AgentDetachResponseMessageSchema>;
 export type AgentRewindResponseMessage = z.infer<typeof AgentRewindResponseMessageSchema>;
 export type UpdateAgentResponseMessage = z.infer<typeof UpdateAgentResponseMessageSchema>;
+export type ProjectDefaultModel = z.infer<typeof ProjectDefaultModelSchema>;
 export type ProjectRenameResponse = z.infer<typeof ProjectRenameResponseSchema>;
+export type ProjectDefaultModelSetResponse = z.infer<typeof ProjectDefaultModelSetResponseSchema>;
+export type ProjectDefaultModelSetResponsePayload = z.infer<
+  typeof ProjectDefaultModelSetResponsePayloadSchema
+>;
+export type ProjectDefaultModelSetRequest = z.infer<typeof ProjectDefaultModelSetRequestSchema>;
 export type ProjectIconSetResponse = z.infer<typeof ProjectIconSetResponseSchema>;
 export type ProjectRemoveResponse = z.infer<typeof ProjectRemoveResponseSchema>;
 export type WorkspaceTitleSetResponse = z.infer<typeof WorkspaceTitleSetResponseSchema>;

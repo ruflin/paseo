@@ -425,6 +425,12 @@ interface ResolvedSessionCreateAgentIntent {
   createdDirectoryWorkspace: boolean;
 }
 
+function withOptionalProjectDefaultModel(
+  project: PersistedProjectRecord | null | undefined,
+): { projectDefaultModel: { provider: string; model?: string | null } } | Record<string, never> {
+  return project?.defaultModel ? { projectDefaultModel: project.defaultModel } : {};
+}
+
 type FetchWorkspacesRequestMessage = Extract<
   SessionInboundMessage,
   { type: "fetch_workspaces_request" }
@@ -2698,6 +2704,7 @@ export class Session {
       this.dispatchWorkspaceLabelMessage(msg) ??
       this.dispatchWorkspaceSetupMessage(msg) ??
       this.dispatchMetadataMessage(msg) ??
+      this.dispatchProjectMetadataMessage(msg) ??
       this.dispatchWorkspaceAndProjectMessage(msg)
     );
   }
@@ -3211,6 +3218,23 @@ export class Session {
     }
   }
 
+  private dispatchProjectMetadataMessage(msg: SessionInboundMessage): Promise<void> | undefined {
+    switch (msg.type) {
+      case "project.rename.request":
+        return this.handleProjectRenameRequest(msg.projectId, msg.customName, msg.requestId);
+      case "project.default_model.set.request":
+        return this.handleProjectDefaultModelSetRequest(
+          msg.projectId,
+          msg.defaultModel,
+          msg.requestId,
+        );
+      case "project.icon.set.request":
+        return this.handleProjectIconSetRequest(msg);
+      default:
+        return undefined;
+    }
+  }
+
   private dispatchAgentLifecycleMessage(msg: SessionInboundMessage): Promise<void> | undefined {
     switch (msg.type) {
       case "fetch_agents_request":
@@ -3229,10 +3253,6 @@ export class Session {
         return this.handleCloseItemsRequest(msg);
       case "update_agent_request":
         return this.handleUpdateAgentRequest(msg.agentId, msg.name, msg.labels, msg.requestId);
-      case "project.rename.request":
-        return this.handleProjectRenameRequest(msg.projectId, msg.customName, msg.requestId);
-      case "project.icon.set.request":
-        return this.handleProjectIconSetRequest(msg);
       case "send_agent_message_request":
         return this.handleSendAgentMessageRequest(msg);
       case "wait_for_finish_request":
@@ -4061,6 +4081,98 @@ export class Session {
           accepted: false,
           customName: null,
           error: getErrorMessageOr(error, "Failed to rename project"),
+        },
+      });
+    }
+  }
+
+  private async handleProjectDefaultModelSetRequest(
+    projectId: string,
+    defaultModel: { provider: string; model?: string | null } | null,
+    requestId: string,
+  ): Promise<void> {
+    this.sessionLogger.info(
+      { projectId, requestId, hasDefaultModel: defaultModel !== null },
+      "session: project.default_model.set.request",
+    );
+
+    try {
+      const existing = await this.projectRegistry.get(projectId);
+      if (!existing) {
+        this.emit({
+          type: "project.default_model.set.response",
+          payload: {
+            requestId,
+            projectId,
+            accepted: false,
+            defaultModel: null,
+            error: "Project not found",
+          },
+        });
+        return;
+      }
+
+      let normalizedDefaultModel: { provider: string; model?: string } | null = null;
+      if (defaultModel !== null) {
+        const provider = defaultModel.provider.trim();
+        if (!provider) {
+          this.emit({
+            type: "project.default_model.set.response",
+            payload: {
+              requestId,
+              projectId,
+              accepted: false,
+              defaultModel: null,
+              error: "Provider is required",
+            },
+          });
+          return;
+        }
+        const trimmedModel =
+          typeof defaultModel.model === "string" ? defaultModel.model.trim() : "";
+        normalizedDefaultModel = trimmedModel ? { provider, model: trimmedModel } : { provider };
+      }
+
+      const updated = {
+        ...existing,
+        defaultModel: normalizedDefaultModel,
+        updatedAt: new Date().toISOString(),
+      };
+      await this.projectRegistry.upsert(updated);
+
+      this.emit({
+        type: "project.default_model.set.response",
+        payload: {
+          requestId,
+          projectId,
+          accepted: true,
+          defaultModel: normalizedDefaultModel,
+          error: null,
+        },
+      });
+
+      await this.emitProjectUpdate({ kind: "upsert", project: updated });
+
+      const workspaces = await this.workspaceRegistry.listActive();
+      const affectedWorkspaceIds = workspaces
+        .filter((workspace) => workspace.projectId === existing.projectId)
+        .map((workspace) => workspace.workspaceId);
+      if (affectedWorkspaceIds.length > 0) {
+        await this.emitWorkspaceUpdatesForWorkspaceIds(affectedWorkspaceIds);
+      }
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, projectId, requestId },
+        "session: project.default_model.set.request error",
+      );
+      this.emit({
+        type: "project.default_model.set.response",
+        payload: {
+          requestId,
+          projectId,
+          accepted: false,
+          defaultModel: null,
+          error: getErrorMessageOr(error, "Failed to update project default model"),
         },
       });
     }
@@ -5038,6 +5150,15 @@ export class Session {
       }),
     });
     config = { ...config, cwd: intent.cwd };
+
+    const requestedModel = typeof config.model === "string" ? config.model.trim() : "";
+    if (!requestedModel || requestedModel === "default") {
+      const workspace = await this.workspaceRegistry.get(intent.workspaceId);
+      const project = workspace ? await this.projectRegistry.get(workspace.projectId) : null;
+      if (project?.defaultModel?.provider === config.provider && project.defaultModel.model) {
+        config = { ...config, model: project.defaultModel.model };
+      }
+    }
 
     return {
       config,
@@ -6190,6 +6311,7 @@ export class Session {
       createdAt: workspace.createdAt,
       diffStat,
       scripts: await this.buildWorkspaceScriptPayloadSnapshot(workspace, resolvedProjectRecord),
+      ...withOptionalProjectDefaultModel(resolvedProjectRecord),
       ...(resolvedProjectRecord
         ? {
             project: await this.buildProjectPlacementForWorkspace(workspace, resolvedProjectRecord),
@@ -6265,6 +6387,7 @@ export class Session {
         : result.workspace.projectId,
       projectCustomName: projectRecord?.customName ?? null,
       projectCustomIconRevision: projectRecord?.customIconRevision ?? null,
+      ...(projectRecord?.defaultModel ? { projectDefaultModel: projectRecord.defaultModel } : {}),
       projectRootPath: projectRecord?.rootPath ?? result.repoRoot,
       workspaceDirectory: result.workspace.cwd,
       setupStatus: this.workspaceSetupObservation.status(result.workspace),
@@ -6457,6 +6580,7 @@ export class Session {
       projectCustomName: project.customName ?? null,
       projectCustomIconRevision: project.customIconRevision ?? null,
       projectIconRevision: icon.revision,
+      ...(project.defaultModel ? { defaultModel: project.defaultModel } : {}),
       projectRootPath: project.rootPath,
       projectKind: project.kind,
     };

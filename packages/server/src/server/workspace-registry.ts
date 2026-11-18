@@ -44,6 +44,13 @@ const PersistedProjectRecordSchema = z.object({
     .nullable()
     .optional()
     .transform((value) => value ?? null),
+  defaultModel: z
+    .object({
+      provider: z.string(),
+      model: z.string().nullable().optional(),
+    })
+    .nullable()
+    .optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
   archivedAt: z.string().nullable(),
@@ -668,6 +675,7 @@ export function createPersistedProjectRecord(input: {
   customName?: string | null;
   projectKey?: string | null;
   customIconRevision?: string | null;
+  defaultModel?: { provider: string; model?: string | null } | null;
   createdAt: string;
   updatedAt: string;
   archivedAt?: string | null;

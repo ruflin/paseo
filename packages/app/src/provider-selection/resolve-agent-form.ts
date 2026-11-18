@@ -18,6 +18,12 @@ export interface FormInitialValues {
   thinkingOptionId?: string | null;
 }
 
+export interface FormProjectDefaults {
+  projectId: string | null;
+  provider?: AgentProvider;
+  model?: string | null;
+}
+
 export interface FormState {
   provider: AgentProvider | null;
   modeId: string;
@@ -43,6 +49,7 @@ export interface AgentFormReducerState {
   inputs?: {
     serverId: string | null;
     initialValues: FormInitialValues | undefined;
+    projectDefaults?: FormProjectDefaults | null;
     active: boolean;
   };
 }
@@ -73,6 +80,7 @@ interface AgentFormInputs {
   isPreferencesLoading: boolean;
   hasSnapshot: boolean;
   initialValues: FormInitialValues | undefined;
+  projectDefaults?: FormProjectDefaults | null;
   preferences: FormPreferences | null;
   providerModelsByProvider: ProviderModelsByProvider;
   allowedProviderMap: Map<AgentProvider, AgentProviderDefinition>;
@@ -84,6 +92,7 @@ export type AgentFormAction =
   | {
       type: "COMPLETE_RESOLUTION";
       initialValues: FormInitialValues | undefined;
+      projectDefaults?: FormProjectDefaults | null;
       preferences: FormPreferences | null;
       providerModelsByProvider: ProviderModelsByProvider;
       allowedProviderMap: Map<AgentProvider, AgentProviderDefinition>;
@@ -263,12 +272,15 @@ function resolveProvider(input: {
   currentProvider: AgentProvider | null;
   userModified: boolean;
   initialValues: FormInitialValues | undefined;
+  projectDefaults?: FormProjectDefaults | null;
   preferences: FormPreferences | null;
 }): AgentProvider | null {
-  const { currentProvider, userModified, initialValues, preferences } = input;
+  const { currentProvider, userModified, initialValues, projectDefaults, preferences } = input;
   // Discovery readiness does not change the user's saved or explicit choice.
   if (userModified) return currentProvider;
-  return initialValues?.provider ?? preferences?.provider ?? currentProvider;
+  return (
+    initialValues?.provider ?? projectDefaults?.provider ?? preferences?.provider ?? currentProvider
+  );
 }
 
 function resolveModeId(input: {
@@ -290,38 +302,51 @@ function resolveModeId(input: {
   });
 }
 
+function resolveConfiguredModelId(
+  availableModels: AgentModelDefinition[] | null,
+  candidateModel: string,
+): string {
+  if (!candidateModel) return "";
+  // COMPAT(default-model-id): added in v0.7.2, remove after 2026-12-06.
+  // Older drafts used "default" before providers exposed concrete model IDs.
+  if (candidateModel === "default" && availableModels?.length) {
+    return (
+      findModelByReference(availableModels, "default")?.id || resolveDefaultModelId(availableModels)
+    );
+  }
+  return !availableModels
+    ? candidateModel
+    : resolveCanonicalModelId(availableModels, candidateModel) || candidateModel;
+}
+
 function resolveModelField(input: {
   provider: AgentProvider | null;
   userModified: boolean;
   currentModel: string;
   initialValues: FormInitialValues | undefined;
+  projectDefaults?: FormProjectDefaults | null;
   providerPrefs: ProviderPrefs | undefined;
   availableModels: AgentModelDefinition[] | null;
 }): string {
-  const { provider, userModified, currentModel, initialValues, providerPrefs, availableModels } =
-    input;
+  const {
+    provider,
+    userModified,
+    currentModel,
+    initialValues,
+    projectDefaults,
+    providerPrefs,
+    availableModels,
+  } = input;
   if (userModified) return currentModel;
   if (!provider) return "";
   const initialModel = normalizeSelectedModelId(initialValues?.model);
+  const projectDefaultModel =
+    projectDefaults?.provider === provider ? normalizeSelectedModelId(projectDefaults.model) : "";
   const preferredModel = normalizeSelectedModelId(providerPrefs?.model);
-  // COMPAT(default-model-id): added in v0.7.2, remove after 2026-12-06.
-  // Older drafts used "default" before providers exposed concrete model IDs.
-  if ((initialModel || preferredModel) === "default" && availableModels?.length) {
-    return (
-      findModelByReference(availableModels, "default")?.id || resolveDefaultModelId(availableModels)
-    );
-  }
-  if (initialModel) {
-    return !availableModels
-      ? initialModel
-      : resolveCanonicalModelId(availableModels, initialModel) || initialModel;
-  }
-  if (preferredModel) {
-    return !availableModels
-      ? preferredModel
-      : resolveCanonicalModelId(availableModels, preferredModel) || preferredModel;
-  }
-  return "";
+  return resolveConfiguredModelId(
+    availableModels,
+    initialModel || projectDefaultModel || preferredModel,
+  );
 }
 
 function resolveThinkingOption(input: {
@@ -365,6 +390,7 @@ export function resolveFormState(
   userModified: UserModifiedFields,
   currentState: FormState,
   allowedProviderMap: Map<AgentProvider, AgentProviderDefinition>,
+  projectDefaults?: FormProjectDefaults | null,
 ): FormState {
   const result = { ...currentState };
 
@@ -372,6 +398,7 @@ export function resolveFormState(
     currentProvider: result.provider,
     userModified: userModified.provider,
     initialValues,
+    projectDefaults,
     preferences,
   });
 
@@ -394,6 +421,7 @@ export function resolveFormState(
     userModified: userModified.model,
     currentModel: result.model,
     initialValues,
+    projectDefaults,
     providerPrefs,
     availableModels,
   });
@@ -426,6 +454,7 @@ export function resolveFormStateFromProviderModels(
   userModified: UserModifiedFields,
   currentState: FormState,
   allowedProviderMap: Map<AgentProvider, AgentProviderDefinition>,
+  projectDefaults?: FormProjectDefaults | null,
 ): FormState {
   const providerResolved = resolveFormState(
     initialValues,
@@ -434,6 +463,7 @@ export function resolveFormStateFromProviderModels(
     userModified,
     currentState,
     allowedProviderMap,
+    projectDefaults,
   );
   const availableModels = providerResolved.provider
     ? (providerModelsByProvider.get(providerResolved.provider) ?? null)
@@ -446,6 +476,7 @@ export function resolveFormStateFromProviderModels(
     userModified,
     currentState,
     allowedProviderMap,
+    projectDefaults,
   );
 }
 
@@ -531,6 +562,7 @@ function completeResolution(
     state.userModified,
     state.form,
     action.allowedProviderMap,
+    action.projectDefaults,
   );
   const nextState = { ...state, resolution: { status: "completed" } as const };
   if (!hasFormStateChanged(state.form, resolved)) return nextState;
@@ -585,6 +617,23 @@ function sameInitialValues(left: FormInitialValues = {}, right: FormInitialValue
   );
 }
 
+function sameProjectId(
+  left: FormProjectDefaults | null | undefined,
+  right: FormProjectDefaults | null | undefined,
+): boolean {
+  return (left?.projectId ?? null) === (right?.projectId ?? null);
+}
+
+function sameProjectDefaultModel(
+  left: FormProjectDefaults | null | undefined,
+  right: FormProjectDefaults | null | undefined,
+): boolean {
+  return (
+    (left?.provider ?? undefined) === (right?.provider ?? undefined) &&
+    normalizeSelectedModelId(left?.model) === normalizeSelectedModelId(right?.model)
+  );
+}
+
 function receiveInputs(
   state: AgentFormReducerState,
   action: AgentFormInputs,
@@ -592,15 +641,27 @@ function receiveInputs(
   const active = action.isVisible && action.isCreateFlow;
   const previous = state.inputs;
   const initial = action.initialValues;
-  const changed =
+  const projectDefaults = action.projectDefaults ?? null;
+  const resetChanged =
     previous?.active !== active ||
     previous.serverId !== action.serverId ||
-    !sameInitialValues(previous.initialValues, initial);
+    !sameInitialValues(previous.initialValues, initial) ||
+    !sameProjectId(previous.projectDefaults, projectDefaults);
+  const projectDefaultModelChanged = !sameProjectDefaultModel(
+    previous?.projectDefaults,
+    projectDefaults,
+  );
   let next = state;
-  if (changed) {
+  if (resetChanged) {
     next = {
       ...resolveAgentForm(state, { type: action.isVisible ? "REQUEST_RESOLUTION" : "RESET" }),
-      inputs: { serverId: action.serverId, initialValues: initial, active },
+      inputs: { serverId: action.serverId, initialValues: initial, projectDefaults, active },
+    };
+  } else if (projectDefaultModelChanged) {
+    next = {
+      ...state,
+      resolution: action.isVisible ? PENDING_AGENT_FORM_RESOLUTION : INITIAL_AGENT_FORM_RESOLUTION,
+      inputs: { serverId: action.serverId, initialValues: initial, projectDefaults, active },
     };
   }
   if (!active || action.isPreferencesLoading || !action.serverId || !action.hasSnapshot)

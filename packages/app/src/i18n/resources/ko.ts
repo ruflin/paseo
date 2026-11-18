@@ -3107,6 +3107,19 @@ export const ko: TranslationResources = {
     project: {
       noEditableTarget: "이 호스트에서는 이 프로젝트를 편집할 수 없습니다.",
       backToProjects: "프로젝트로 돌아가기",
+      defaultModel: {
+        title: "기본 모델",
+        info: "이 프로젝트에서 새 워크스페이스 또는 에이전트 탭을 만들 때 사용되는 기본 제공자 및 모델",
+        selection: "모델 선택",
+        global: "전역 기본값",
+        custom: "사용자 지정",
+        globalHint: "전역에서 마지막으로 사용한 모델 사용",
+        customHint: "이 프로젝트의 새 에이전트를 항상 선택한 모델로 시작",
+        model: "모델",
+        modelHint: "이 프로젝트의 새 에이전트에 사용할 제공자 및 모델",
+        savedToast: "기본 모델이 업데이트되었습니다",
+        saveError: "기본 모델을 저장할 수 없습니다",
+      },
       edit: {
         title: "프로젝트 편집",
         name: "이름",

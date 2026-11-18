@@ -3121,6 +3121,19 @@ export const ja: TranslationResources = {
     project: {
       noEditableTarget: "このホストではこのプロジェクトを編集できません。",
       backToProjects: "プロジェクトに戻る",
+      defaultModel: {
+        title: "デフォルトモデル",
+        info: "このプロジェクトで新しいワークスペースやエージェントタブを作成する際に使用されるデフォルトのプロバイダーとモデル",
+        selection: "モデルの選択",
+        global: "グローバル設定",
+        custom: "カスタム",
+        globalHint: "グローバルで最後に使用したモデルを使う",
+        customHint: "このプロジェクトの新しいエージェントを常に選択したモデルで開始する",
+        model: "モデル",
+        modelHint: "このプロジェクトの新しいエージェントに使用するプロバイダーとモデル",
+        savedToast: "デフォルトモデルを更新しました",
+        saveError: "デフォルトモデルを保存できませんでした",
+      },
       edit: {
         title: "プロジェクトを編集",
         name: "名前",

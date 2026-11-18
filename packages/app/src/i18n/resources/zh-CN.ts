@@ -3053,6 +3053,19 @@ export const zhCN: TranslationResources = {
     project: {
       noEditableTarget: "此项目无法在这个 Host 上编辑。",
       backToProjects: "返回 Projects",
+      defaultModel: {
+        title: "默认模型",
+        info: "在此 Project 中新建 Workspace 或 Agent 标签页时使用的默认 Provider 和模型",
+        selection: "模型选择",
+        global: "全局默认",
+        custom: "自定义",
+        globalHint: "使用全局最近使用的模型",
+        customHint: "在此 Project 中新建 Agent 时始终使用所选模型",
+        model: "模型",
+        modelHint: "此 Project 中新建 Agent 使用的 Provider 和模型",
+        savedToast: "默认模型已更新",
+        saveError: "无法保存默认模型",
+      },
       edit: {
         title: "编辑 Project",
         name: "名称",

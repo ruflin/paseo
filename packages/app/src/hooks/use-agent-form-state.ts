@@ -31,6 +31,7 @@ import {
   RESOLVABLE_PROVIDER_STATUSES,
   SELECTABLE_PROVIDER_STATUSES,
   type FormInitialValues,
+  type FormProjectDefaults,
   type FormState,
   type ProviderModelsByProvider,
 } from "@/provider-selection/resolve-agent-form";
@@ -38,12 +39,16 @@ import { openAgentForm, type AgentFormCatalog } from "@/provider-selection/agent
 import { useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import type { MaterializedAgentProfile } from "@/agent-profiles";
 
-export type { FormInitialValues } from "@/provider-selection/resolve-agent-form";
+export type {
+  FormInitialValues,
+  FormProjectDefaults,
+} from "@/provider-selection/resolve-agent-form";
 
 export interface UseAgentFormStateOptions {
   serverId: string | null;
   workingDir: string;
   initialValues?: FormInitialValues;
+  projectDefaults?: FormProjectDefaults | null;
   isVisible?: boolean;
   isCreateFlow?: boolean;
 }
@@ -154,7 +159,14 @@ async function persistProviderPreferences(input: {
 }
 
 export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFormStateResult {
-  const { serverId, initialValues, workingDir, isVisible = true, isCreateFlow = true } = options;
+  const {
+    serverId,
+    initialValues,
+    projectDefaults = null,
+    workingDir,
+    isVisible = true,
+    isCreateFlow = true,
+  } = options;
 
   const { preferences, isLoading: isPreferencesLoading, updatePreferences } = useFormPreferences();
   const preferenceOverlayRef = useRef(new OptimisticFormPreferences(preferences));
@@ -281,6 +293,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
       isPreferencesLoading,
       hasSnapshot: snapshotEntries !== undefined,
       initialValues,
+      projectDefaults,
       preferences,
       providerModelsByProvider: snapshotProviderModelsByProvider,
       allowedProviderMap: snapshotResolvableProviderDefinitionMap,
@@ -292,6 +305,7 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
     isPreferencesLoading,
     snapshotEntries,
     initialValues,
+    projectDefaults,
     preferences,
     snapshotProviderModelsByProvider,
     snapshotResolvableProviderDefinitionMap,
@@ -456,13 +470,17 @@ export function useAgentFormState(options: UseAgentFormStateOptions): UseAgentFo
     if (!formState.provider) {
       return;
     }
+    const { userModified } = formStore.getState();
+    if (projectDefaults?.provider && !userModified.provider && !userModified.model) {
+      return;
+    }
     await persistProviderPreferences({
       provider: formState.provider,
       formState,
       availableModels,
       updatePreferences: updateCurrentPreferences,
     });
-  }, [availableModels, formState, updateCurrentPreferences]);
+  }, [availableModels, formState, formStore, projectDefaults?.provider, updateCurrentPreferences]);
 
   const agentDefinition = formState.provider
     ? providerDefinitionMap.get(formState.provider)

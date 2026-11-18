@@ -98,6 +98,7 @@ import type {
   PaseoWorktreeListResponse,
   PaseoWorktreeArchiveResponse,
   ProjectIconSource,
+  ProjectDefaultModel,
   ProjectIconResponse,
   ProjectIconGetResponse,
   ProjectAddResponse,
@@ -3685,6 +3686,26 @@ export class DaemonClient {
       throw new Error(payload.error ?? "renameProject rejected");
     }
     return { customName: payload.customName };
+  }
+
+  async setProjectDefaultModel(
+    projectId: string,
+    defaultModel: ProjectDefaultModel | null,
+    requestId?: string,
+  ): Promise<{ defaultModel: ProjectDefaultModel | null }> {
+    const payload =
+      await this.sendNamespacedCorrelatedSessionRequest<"project.default_model.set.response">({
+        requestId,
+        message: {
+          type: "project.default_model.set.request",
+          projectId,
+          defaultModel,
+        },
+      });
+    if (!payload.accepted) {
+      throw new Error(payload.error ?? "setProjectDefaultModel rejected");
+    }
+    return { defaultModel: payload.defaultModel };
   }
 
   async setProjectIcon(

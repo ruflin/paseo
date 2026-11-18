@@ -3134,6 +3134,19 @@ export const ptBR: TranslationResources = {
     project: {
       noEditableTarget: "Este projeto não pode ser editado neste host.",
       backToProjects: "Voltar para projetos",
+      defaultModel: {
+        title: "Modelo padrão",
+        info: "Provedor e modelo padrão usados ao criar novos workspaces ou abas de agente neste projeto",
+        selection: "Seleção de modelo",
+        global: "Padrão global",
+        custom: "Personalizado",
+        globalHint: "Usar o último modelo usado globalmente",
+        customHint: "Sempre iniciar novos agentes neste projeto com o modelo selecionado",
+        model: "Modelo",
+        modelHint: "Provedor e modelo usados para novos agentes neste projeto",
+        savedToast: "Modelo padrão atualizado",
+        saveError: "Não foi possível salvar o modelo padrão",
+      },
       edit: {
         title: "Editar projeto",
         name: "Nome",

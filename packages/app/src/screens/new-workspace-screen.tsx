@@ -46,7 +46,11 @@ import {
   navigateToWorkspace,
   useLastWorkspaceSelection,
 } from "@/stores/navigation-active-workspace-store";
-import { normalizeWorkspaceDescriptor, type WorkspaceDescriptor } from "@/stores/session-store";
+import {
+  normalizeWorkspaceDescriptor,
+  useSessionStore,
+  type WorkspaceDescriptor,
+} from "@/stores/session-store";
 import { useWorkspace } from "@/stores/session-store-hooks";
 import { buildNewWorkspaceDraftKey, generateDraftId } from "@/stores/draft-keys";
 import { useOpenAddProject } from "@/hooks/use-open-add-project";
@@ -58,7 +62,7 @@ import {
 import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
 import type { KeyboardActionId } from "@/keyboard/keyboard-action-dispatcher";
 import { useFormPreferences } from "@/hooks/use-form-preferences";
-import type { CreateAgentInitialValues } from "@/hooks/use-agent-form-state";
+import type { CreateAgentInitialValues, FormProjectDefaults } from "@/hooks/use-agent-form-state";
 import { toErrorMessage } from "@/utils/error-messages";
 import {
   getHostProjectId,
@@ -524,17 +528,54 @@ async function createWorkspaceChatAgent(input: CreateChatAgentInput): Promise<Su
   return outcome;
 }
 
+function useNewWorkspaceProjectDefaults(
+  selectedServerId: string,
+  selectedProject: Parameters<typeof getHostProjectId>[0] | null,
+): FormProjectDefaults | null {
+  const selectedHostProjectId =
+    selectedProject && selectedServerId
+      ? getHostProjectId(selectedProject, selectedServerId)
+      : null;
+  const selectedProjectDefaultModel = useSessionStore((state) =>
+    selectedHostProjectId
+      ? (state.sessions[selectedServerId]?.projects.get(selectedHostProjectId)?.defaultModel ??
+        null)
+      : null,
+  );
+  return useMemo<FormProjectDefaults | null>(
+    () =>
+      selectedHostProjectId
+        ? {
+            projectId: selectedHostProjectId,
+            ...(selectedProjectDefaultModel?.provider
+              ? {
+                  provider: selectedProjectDefaultModel.provider,
+                  model: selectedProjectDefaultModel.model ?? null,
+                }
+              : {}),
+          }
+        : null,
+    [
+      selectedHostProjectId,
+      selectedProjectDefaultModel?.model,
+      selectedProjectDefaultModel?.provider,
+    ],
+  );
+}
+
 function buildComposerConfig(input: {
   serverId: string;
   workspaceDirectory: string | null;
   sourceDirectory: string | null;
   initialSetup?: WorkspaceDraftTabSetup | null;
+  projectDefaults?: FormProjectDefaults | null;
 }): Parameters<typeof useAgentInputDraft>[0]["composer"] {
-  const { serverId, workspaceDirectory, sourceDirectory, initialSetup } = input;
+  const { serverId, workspaceDirectory, sourceDirectory, initialSetup, projectDefaults } = input;
   const workingDir = workspaceDirectory || sourceDirectory || undefined;
   return {
     initialServerId: serverId || null,
     initialValues: buildComposerInitialValues({ initialSetup }),
+    projectDefaults: projectDefaults ?? null,
     initialProviderOptions: initialSetup?.providerOptions,
     context: "new-workspace" as const,
     isVisible: true,
@@ -995,6 +1036,7 @@ export function NewWorkspaceScreen({
     () => resolveVisibleDraftContextScopeKeys({ isDraftHandoffActive, draftContextScopeKey }),
     [draftContextScopeKey, isDraftHandoffActive],
   );
+  const projectDefaults = useNewWorkspaceProjectDefaults(selectedServerId, selectedProject);
   const chatDraft = useAgentInputDraft({
     draftKey,
     composer: buildComposerConfig({
@@ -1002,6 +1044,7 @@ export function NewWorkspaceScreen({
       workspaceDirectory: workspace?.workspaceDirectory ?? null,
       sourceDirectory: selectedSourceDirectory,
       initialSetup: forkDraftSetup?.setup,
+      projectDefaults,
     }),
   });
   const composerState = chatDraft.composerState;

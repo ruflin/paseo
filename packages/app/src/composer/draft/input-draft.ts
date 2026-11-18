@@ -7,6 +7,7 @@ import type { DraftCommandTarget } from "@/agent-commands";
 import {
   useAgentFormState,
   type CreateAgentInitialValues,
+  type FormProjectDefaults,
   type UseAgentFormStateResult,
 } from "@/hooks/use-agent-form-state";
 import { useDraftProviderOptions } from "@/hooks/use-draft-provider-options";
@@ -37,6 +38,7 @@ type AttachmentUpdater =
 interface AgentInputDraftComposerOptions {
   initialServerId: string | null;
   initialValues?: CreateAgentInitialValues;
+  projectDefaults?: FormProjectDefaults | null;
   initialProviderOptions?: Record<string, unknown>;
   /** Which composer a plugin's `useComposer()` reports. */
   context?: "draft" | "new-workspace";
@@ -81,6 +83,7 @@ export function useAgentInputDraft(input: UseAgentInputDraftInput): AgentInputDr
     workingDir,
     serverId: composerOptions?.initialServerId ?? null,
     initialValues: composerOptions?.initialValues,
+    projectDefaults: composerOptions?.projectDefaults ?? null,
     isVisible: composerOptions?.isVisible ?? false,
     isCreateFlow: true,
   });

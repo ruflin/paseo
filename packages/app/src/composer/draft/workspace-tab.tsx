@@ -12,13 +12,13 @@ import { ComposerImportPill } from "@/composer/draft/import-pill";
 import { COMPOSER_PILL_CLEARANCE } from "@/composer/pill-styles";
 import { composerWorkspaceAttachment } from "@/composer/attachments/workspace";
 import { useAgentInputDraft } from "@/composer/draft/input-draft";
-import type { CreateAgentInitialValues } from "@/hooks/use-agent-form-state";
+import type { CreateAgentInitialValues, FormProjectDefaults } from "@/hooks/use-agent-form-state";
 import { useDraftAgentCreateFlow, type DraftCreateAttempt } from "@/composer/draft/create-flow";
 import { useHostRuntimeClient, useHostRuntimeIsConnected } from "@/runtime/host-runtime";
 import { buildWorkspaceDraftAgentConfig } from "@/screens/workspace/workspace-draft-agent-config";
 import { buildDraftStoreKey } from "@/stores/draft-keys";
 import { useCreateFlowStore } from "@/stores/create-flow-store";
-import type { Agent } from "@/stores/session-store";
+import { useSessionStore, type Agent } from "@/stores/session-store";
 import { useWorkspaceFields } from "@/stores/session-store-hooks";
 import { useWorkspaceDraftSubmissionStore } from "@/stores/workspace-draft-submission-store";
 import { useAgentControlCommandCenterActions } from "@/command-center/agent-control-registration";
@@ -275,6 +275,41 @@ function resolveImportPillPress(
   return onOpenImportSheet ?? null;
 }
 
+function useWorkspaceProjectDefaults(
+  serverId: string,
+  workspaceFields:
+    | {
+        projectId: string;
+        projectDefaultModel: { provider: string; model?: string | null } | null;
+      }
+    | null
+    | undefined,
+): FormProjectDefaults | null {
+  const workspaceProjectId = workspaceFields?.projectId ?? null;
+  const workspaceFallback = workspaceFields?.projectDefaultModel ?? null;
+  const projectRecordDefaultModel = useSessionStore((state) =>
+    workspaceProjectId
+      ? (state.sessions[serverId]?.projects.get(workspaceProjectId)?.defaultModel ?? null)
+      : null,
+  );
+  const effectiveDefault = projectRecordDefaultModel ?? workspaceFallback;
+  return useMemo<FormProjectDefaults | null>(
+    () =>
+      workspaceProjectId
+        ? {
+            projectId: workspaceProjectId,
+            ...(effectiveDefault?.provider
+              ? {
+                  provider: effectiveDefault.provider,
+                  model: effectiveDefault.model ?? null,
+                }
+              : {}),
+          }
+        : null,
+    [effectiveDefault?.model, effectiveDefault?.provider, workspaceProjectId],
+  );
+}
+
 /**
  * Creates the agent from the draft's first prompt. The conversation panel shows that prompt in
  * the timeline from the create-flow store while the agent is created.
@@ -296,7 +331,10 @@ export function WorkspaceDraftComposer({
   const workspaceFields = useWorkspaceFields(serverId, workspaceId, (w) => ({
     workspaceDirectory: w.workspaceDirectory,
     id: w.id,
+    projectId: w.projectId,
+    projectDefaultModel: w.projectDefaultModel ?? null,
   }));
+  const projectDefaults = useWorkspaceProjectDefaults(serverId, workspaceFields);
   const workspaceDirectory = workspaceFields?.workspaceDirectory || null;
   const draftSetup = initialSetup ?? null;
   const draftWorkingDirectory = resolveDraftWorkingDirectory({
@@ -320,6 +358,7 @@ export function WorkspaceDraftComposer({
     composer: {
       initialServerId: serverId,
       initialValues: draftInitialValues,
+      projectDefaults,
       initialProviderOptions: draftSetup?.providerOptions,
       isVisible: true,
       lockedWorkingDir: draftWorkingDirectory ?? undefined,

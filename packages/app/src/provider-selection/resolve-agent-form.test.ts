@@ -1269,3 +1269,109 @@ it("owns input readiness, reopening and user edits in the reducer", () => {
   state = resolveAgentForm(state, { ...inputs, isPreferencesLoading: false, hasSnapshot: true });
   expect(state.form).toMatchObject({ provider: "codex", model: "astra" });
 });
+
+describe("per-project default model resolution", () => {
+  it("uses projectDefaults over global preferences when initialValues are absent", () => {
+    const resolved = resolveFormState(
+      undefined,
+      {
+        provider: "codex",
+        providerPreferences: {
+          codex: { model: "gpt-5.4" },
+          claude: { model: "claude-sonnet-4-6" },
+        },
+      },
+      null,
+      INITIAL_USER_MODIFIED,
+      makeState().form,
+      bothProviderMap,
+      { projectId: "prj_a", provider: "claude", model: "claude-opus-4-6" },
+    );
+
+    expect(resolved.provider).toBe("claude");
+    expect(resolved.model).toBe("claude-opus-4-6");
+  });
+
+  it("prefers explicit initialValues over projectDefaults", () => {
+    const resolved = resolveFormState(
+      { provider: "codex", model: "gpt-5.3-codex" },
+      { provider: "codex", providerPreferences: { codex: { model: "gpt-5.4" } } },
+      null,
+      INITIAL_USER_MODIFIED,
+      makeState().form,
+      bothProviderMap,
+      { projectId: "prj_a", provider: "claude", model: "claude-opus-4-6" },
+    );
+
+    expect(resolved.provider).toBe("codex");
+    expect(resolved.model).toBe("gpt-5.3-codex");
+  });
+
+  it("resets user selection when projectId changes and updates unmodified fields when defaultModel changes", () => {
+    const baseInputs = {
+      type: "INPUTS_CHANGED" as const,
+      serverId: "host",
+      isVisible: true,
+      isCreateFlow: true,
+      isPreferencesLoading: false,
+      hasSnapshot: true,
+      initialValues: undefined,
+      preferences: {
+        provider: "codex",
+        providerPreferences: { codex: { model: "gpt-5.3-codex" } },
+      },
+      allowedProviderMap: bothProviderMap,
+      providerModelsByProvider: makeProviderModelsByProvider([
+        ["codex", CODEX_MODELS],
+        ["claude", null],
+      ]),
+      projectDefaults: {
+        projectId: "prj_a",
+        provider: "claude" as AgentProvider,
+        model: "claude-opus-4-6",
+      },
+    };
+
+    // Opens with project A's default model.
+    let state = resolveAgentForm(makeState(), baseInputs);
+    expect(state.form).toMatchObject({ provider: "claude", model: "claude-opus-4-6" });
+
+    // User manually switches model on project A.
+    state = resolveAgentForm(state, {
+      type: "SET_MODEL_FROM_USER",
+      modelId: "claude-haiku-4-5",
+      availableModels: null,
+      providerPrefs: undefined,
+    });
+    expect(state.form.model).toBe("claude-haiku-4-5");
+
+    // Background update to project A's default keeps user's modified model.
+    state = resolveAgentForm(state, {
+      ...baseInputs,
+      projectDefaults: {
+        projectId: "prj_a",
+        provider: "claude",
+        model: "claude-sonnet-4-6",
+      },
+    });
+    expect(state.form.model).toBe("claude-haiku-4-5");
+
+    // Switching to project B (no custom default) resets to global preferences.
+    state = resolveAgentForm(state, {
+      ...baseInputs,
+      projectDefaults: { projectId: "prj_b" },
+    });
+    expect(state.form).toMatchObject({ provider: "codex", model: "gpt-5.3-codex" });
+
+    // Updating project B's default while user hasn't modified updates the form immediately.
+    state = resolveAgentForm(state, {
+      ...baseInputs,
+      projectDefaults: {
+        projectId: "prj_b",
+        provider: "claude",
+        model: "claude-opus-4-6",
+      },
+    });
+    expect(state.form).toMatchObject({ provider: "claude", model: "claude-opus-4-6" });
+  });
+});

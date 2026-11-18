@@ -1,3 +1,4 @@
+import type { ProjectDefaultModel } from "@getpaseo/protocol/messages";
 import type { ProjectDescriptor, WorkspaceDescriptor } from "@/stores/session-store";
 import type { HostProjectListItem } from "@/projects/host-project-model";
 import { buildWorkspaceStructureProjects } from "@/projects/workspace-structure";
@@ -32,6 +33,7 @@ export interface ProjectHostEntry {
   githubRuntime?: WorkspaceDescriptor["githubRuntime"];
   customIconRevision?: string | null;
   iconRevision?: string;
+  defaultModel?: ProjectDefaultModel | null;
 }
 
 export interface ProjectSummary {
@@ -95,6 +97,7 @@ interface HostGroup {
   workspaces: WorkspaceDescriptor[];
   customIconRevision?: string | null;
   iconRevision?: string;
+  defaultModel?: ProjectDefaultModel | null;
   // The project record exists before its first workspace. Keep its editable
   // root at the project boundary instead of deriving it from child rows.
   projectRoot: string;
@@ -110,12 +113,17 @@ interface ProjectGroup {
 function findProjectMetadata(
   host: ProjectHost,
   projectId: string,
-): { customName: string | null; displayName: string } | null {
+): {
+  customName: string | null;
+  displayName: string;
+  defaultModel: ProjectDefaultModel | null;
+} | null {
   for (const project of host.projects) {
     if (project.projectId === projectId) {
       return {
         customName: project.projectCustomName ?? null,
         displayName: project.projectDisplayName,
+        defaultModel: project.defaultModel ?? null,
       };
     }
   }
@@ -188,6 +196,7 @@ function toHostEntry(group: HostGroup): ProjectHostEntry {
     githubRuntime: canonical?.githubRuntime,
     customIconRevision: canonical?.projectCustomIconRevision ?? group.customIconRevision,
     iconRevision: group.iconRevision,
+    defaultModel: group.defaultModel ?? canonical?.projectDefaultModel ?? null,
   };
 }
 
@@ -253,6 +262,7 @@ function addHostProjects(
         workspaces: [],
         customIconRevision: placement.customIconRevision,
         iconRevision: placement.iconRevision,
+        defaultModel: customName?.defaultModel ?? null,
         projectRoot: repoRootByProjectId.get(projectId) ?? "",
       });
     }

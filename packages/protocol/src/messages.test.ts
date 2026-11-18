@@ -631,3 +631,67 @@ describe("terminal collection protocol compatibility", () => {
     ).toMatchObject({ payload: { terminals: [{ isScript: true, createdAt: null }] } });
   });
 });
+
+describe("project default model protocol compatibility", () => {
+  test("parses project.default_model.set request and response", () => {
+    expect(
+      SessionInboundMessageSchema.parse({
+        type: "project.default_model.set.request",
+        projectId: "prj_123",
+        defaultModel: { provider: "claude", model: "claude-opus-4-6" },
+        requestId: "req-1",
+      }),
+    ).toEqual({
+      type: "project.default_model.set.request",
+      projectId: "prj_123",
+      defaultModel: { provider: "claude", model: "claude-opus-4-6" },
+      requestId: "req-1",
+    });
+
+    expect(
+      SessionOutboundMessageSchema.parse({
+        type: "project.default_model.set.response",
+        payload: {
+          requestId: "req-1",
+          projectId: "prj_123",
+          accepted: true,
+          defaultModel: null,
+          error: null,
+        },
+      }),
+    ).toEqual({
+      type: "project.default_model.set.response",
+      payload: {
+        requestId: "req-1",
+        projectId: "prj_123",
+        accepted: true,
+        defaultModel: null,
+        error: null,
+      },
+    });
+  });
+
+  test("preserves optional defaultModel on project and workspace descriptors", () => {
+    const project = WorkspaceProjectDescriptorPayloadSchema.parse({
+      projectId: "prj_123",
+      projectDisplayName: "Paseo",
+      projectRootPath: "/repo/paseo",
+      projectKind: "git",
+      defaultModel: { provider: "codex", model: "gpt-5.4" },
+    });
+    expect(project.defaultModel).toEqual({ provider: "codex", model: "gpt-5.4" });
+
+    const workspace = SessionOutboundMessageSchema.parse(
+      fetchWorkspacesResponse(
+        workspaceDescriptor({
+          projectDefaultModel: { provider: "codex", model: "gpt-5.4" },
+        }),
+      ),
+    );
+    expect(workspace).toMatchObject({
+      payload: {
+        entries: [{ projectDefaultModel: { provider: "codex", model: "gpt-5.4" } }],
+      },
+    });
+  });
+});

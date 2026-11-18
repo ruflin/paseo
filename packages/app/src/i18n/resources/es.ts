@@ -3153,6 +3153,19 @@ export const es: TranslationResources = {
     project: {
       noEditableTarget: "Este proyecto no se puede editar en este host.",
       backToProjects: "Volver a proyectos",
+      defaultModel: {
+        title: "Modelo predeterminado",
+        info: "Proveedor y modelo predeterminados al crear nuevos espacios de trabajo o pestañas de agente en este proyecto",
+        selection: "Selección de modelo",
+        global: "Predeterminado global",
+        custom: "Personalizado",
+        globalHint: "Usar tu último modelo utilizado globalmente",
+        customHint: "Iniciar siempre nuevos agentes en este proyecto con el modelo seleccionado",
+        model: "Modelo",
+        modelHint: "Proveedor y modelo usados para nuevos agentes en este proyecto",
+        savedToast: "Modelo predeterminado actualizado",
+        saveError: "No se pudo guardar el modelo predeterminado",
+      },
       edit: {
         title: "Editar proyecto",
         name: "Nombre",

@@ -303,6 +303,11 @@ const WorkspaceGitRuntimeSchema = z
   .nullable()
   .optional();
 
+const ProjectDefaultModelCacheSchema = z.strictObject({
+  provider: z.string(),
+  model: z.string().nullable().optional(),
+});
+
 const StoredWorkspaceSchema = z.strictObject({
   parentWorkspaceId: z.string().optional(),
   // Require both keys: a cursor without these values would preserve the wrong sort on reconnect.
@@ -313,6 +318,7 @@ const StoredWorkspaceSchema = z.strictObject({
   projectDisplayName: z.string(),
   projectCustomName: z.string().nullable(),
   projectCustomIconRevision: z.string().nullable(),
+  projectDefaultModel: ProjectDefaultModelCacheSchema.nullable().optional(),
   projectRootPath: z.string(),
   workspaceDirectory: z.string(),
   worktreeSlug: z.string().optional(),
@@ -346,6 +352,7 @@ const StoredProjectSchema = z.strictObject({
   projectCustomName: z.string().nullable(),
   projectCustomIconRevision: z.string().nullable(),
   projectIconRevision: z.string().optional(),
+  defaultModel: ProjectDefaultModelCacheSchema.nullable().optional(),
   projectRootPath: z.string(),
   projectKind: z.enum(["git", "non_git", "directory"]),
 });
@@ -739,6 +746,9 @@ function serializeWorkspace(workspace: WorkspaceDescriptor): StoredWorkspace {
     projectDisplayName: workspace.projectDisplayName,
     projectCustomName: workspace.projectCustomName ?? null,
     projectCustomIconRevision: workspace.projectCustomIconRevision ?? null,
+    ...(workspace.projectDefaultModel
+      ? { projectDefaultModel: workspace.projectDefaultModel }
+      : {}),
     projectRootPath: workspace.projectRootPath,
     workspaceDirectory: workspace.workspaceDirectory,
     worktreeSlug: workspace.worktreeSlug,
@@ -782,6 +792,7 @@ function serializeProject(project: ProjectDescriptor): StoredProject {
     projectCustomName: project.projectCustomName,
     projectCustomIconRevision: project.projectCustomIconRevision ?? null,
     projectIconRevision: project.projectIconRevision,
+    ...(project.defaultModel ? { defaultModel: project.defaultModel } : {}),
     projectRootPath: project.projectRootPath,
     projectKind: project.projectKind,
   };

@@ -3223,6 +3223,19 @@ export const en = {
     project: {
       noEditableTarget: "This project isn't editable on this host.",
       backToProjects: "Back to projects",
+      defaultModel: {
+        title: "Default model",
+        info: "Default provider and model used when creating new workspaces or agent tabs in this project",
+        selection: "Model selection",
+        global: "Global default",
+        custom: "Custom",
+        globalHint: "Use your global last-used model",
+        customHint: "Always start new agents in this project with the selected model",
+        model: "Model",
+        modelHint: "Provider and model used for new agents in this project",
+        savedToast: "Default model updated",
+        saveError: "Couldn't save default model",
+      },
       edit: {
         title: "Edit project",
         name: "Name",

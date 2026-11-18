@@ -7,12 +7,15 @@ import { StyleSheet } from "react-native-unistyles";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, MoreVertical, Pencil, Plus } from "lucide-react-native";
 import { ProjectIconView } from "@/components/project-icon-view";
+import type { AgentProvider } from "@getpaseo/protocol/agent-types";
 import type {
   PaseoConfigRaw,
   PaseoConfigRevision,
   ProjectConfigRpcError,
+  ProjectDefaultModel,
 } from "@getpaseo/protocol/messages";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
+import { CombinedModelSelector } from "@/components/combined-model-selector";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -22,6 +25,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Alert } from "@/components/ui/alert";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
+import { SegmentedControl } from "@/components/ui/segmented-control";
 import { Switch } from "@/components/ui/switch";
 import { AdaptiveModalSheet, type SheetHeader } from "@/components/adaptive-modal-sheet";
 import { ProjectEditSheet } from "@/components/project-edit-sheet";
@@ -31,6 +35,8 @@ import { SettingsGroup } from "@/components/settings/headings/settings-group";
 import { SettingsSection } from "@/components/settings/headings/settings-section";
 import { settingsStyles } from "@/styles/settings";
 import { useProjects } from "@/hooks/use-projects";
+import { useProvidersSnapshot } from "@/hooks/use-providers-snapshot";
+import { buildSelectableProviderSelectorProviders } from "@/provider-selection/provider-selection";
 import type { ProjectEditFormSnapshot } from "@/projects/edit-form";
 import { useProjectIcons } from "@/projects/icons";
 import { createProjectIconTarget } from "@/projects/icon-target";
@@ -227,6 +233,7 @@ function ProjectSettingsBody({
 
   const data = readQuery.data;
   const supportsCustomIcon = useHostFeature(selectedHost.serverId, "projectCustomIcon");
+  const supportsDefaultModel = useHostFeature(selectedHost.serverId, "projectDefaultModel");
   const customIconRevision = selectedHost.customIconRevision ?? null;
   const projectIconTargets = useMemo(() => {
     const target = createProjectIconTarget({
@@ -300,6 +307,10 @@ function ProjectSettingsBody({
         supportsCustomIcon={supportsCustomIcon}
         snapshot={editSnapshot}
       />
+
+      {supportsDefaultModel && !isHostGone ? (
+        <ProjectDefaultModelSection client={client} selectedHost={selectedHost} />
+      ) : null}
 
       {renderContent({
         readQuery,
@@ -831,6 +842,159 @@ function ProjectConfigForm({
 
 function ResolveSpinnerColor(): string {
   return styles.spinnerColor.color;
+}
+
+type DefaultModelMode = "global" | "custom";
+
+function ProjectDefaultModelSection({
+  client,
+  selectedHost,
+}: {
+  client: DaemonClient;
+  selectedHost: ProjectHostEntry;
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const toast = useToast();
+  const snapshot = useProvidersSnapshot(selectedHost.serverId, { cwd: selectedHost.repoRoot });
+  const providers = useMemo(
+    () => buildSelectableProviderSelectorProviders(snapshot.entries),
+    [snapshot.entries],
+  );
+  const savedDefaultModel = selectedHost.defaultModel ?? null;
+  const savedMode: DefaultModelMode = savedDefaultModel ? "custom" : "global";
+  const [draftMode, setDraftMode] = useState<DefaultModelMode | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const mode = draftMode ?? savedMode;
+
+  useEffect(() => {
+    setDraftMode(null);
+  }, [savedDefaultModel?.model, savedDefaultModel?.provider]);
+
+  const mutation = useMutation({
+    mutationFn: (nextDefaultModel: ProjectDefaultModel | null) =>
+      client.setProjectDefaultModel(selectedHost.projectId, nextDefaultModel),
+    onSuccess: () => {
+      setSaveError(null);
+      queryClient.invalidateQueries({ queryKey: ["projects"] });
+      toast.show(t("settings.project.defaultModel.savedToast"), { variant: "success" });
+    },
+    onError: (error) => {
+      setDraftMode(null);
+      setSaveError(errorToDetail(error) ?? t("settings.project.defaultModel.saveError"));
+    },
+  });
+
+  const modeOptions = useMemo(
+    () => [
+      {
+        value: "global" as const,
+        label: t("settings.project.defaultModel.global"),
+        disabled: mutation.isPending,
+      },
+      {
+        value: "custom" as const,
+        label: t("settings.project.defaultModel.custom"),
+        disabled: mutation.isPending,
+      },
+    ],
+    [mutation.isPending, t],
+  );
+
+  const handleModeChange = useCallback(
+    (next: DefaultModelMode) => {
+      setDraftMode(next);
+      setSaveError(null);
+      if (next === "global" && savedDefaultModel !== null) {
+        mutation.mutate(null);
+      }
+    },
+    [mutation, savedDefaultModel],
+  );
+
+  const handleModelSelect = useCallback(
+    (provider: AgentProvider, model: string) => {
+      setDraftMode("custom");
+      setSaveError(null);
+      mutation.mutate({ provider, ...(model ? { model } : {}) });
+    },
+    [mutation],
+  );
+
+  const handleSelectorOpen = useCallback(() => {
+    snapshot.refetchIfStale(savedDefaultModel?.provider);
+  }, [savedDefaultModel?.provider, snapshot]);
+
+  const handleRetryProvider = useCallback(
+    (provider: AgentProvider) => snapshot.refresh([provider]),
+    [snapshot],
+  );
+
+  return (
+    <SettingsSection
+      title={t("settings.project.defaultModel.title")}
+      info={t("settings.project.defaultModel.info")}
+      testID="project-default-model-section"
+    >
+      <View style={settingsStyles.card}>
+        <View style={settingsStyles.row}>
+          <View style={settingsStyles.rowContent}>
+            <Text style={settingsStyles.rowTitle}>
+              {t("settings.project.defaultModel.selection")}
+            </Text>
+            <Text style={settingsStyles.rowHint}>
+              {mode === "global"
+                ? t("settings.project.defaultModel.globalHint")
+                : t("settings.project.defaultModel.customHint")}
+            </Text>
+          </View>
+          <SegmentedControl
+            options={modeOptions}
+            value={mode}
+            onValueChange={handleModeChange}
+            testID="project-default-model-mode"
+          />
+        </View>
+        {mode === "custom" ? (
+          <View style={[settingsStyles.row, settingsStyles.rowBorder]}>
+            <View style={settingsStyles.rowContent}>
+              <Text style={settingsStyles.rowTitle}>
+                {t("settings.project.defaultModel.model")}
+              </Text>
+              <Text style={settingsStyles.rowHint}>
+                {t("settings.project.defaultModel.modelHint")}
+              </Text>
+            </View>
+            <CombinedModelSelector
+              providers={providers}
+              selectedProvider={savedDefaultModel?.provider ?? ""}
+              selectedModel={savedDefaultModel?.model ?? ""}
+              onSelect={handleModelSelect}
+              isLoading={snapshot.isLoading || snapshot.isFetching}
+              onOpen={handleSelectorOpen}
+              onRetryProvider={handleRetryProvider}
+              isRetryingProvider={snapshot.isRefreshing}
+              disabled={mutation.isPending}
+              serverId={selectedHost.serverId}
+              desktopPlacement="bottom-start"
+              desktopMinWidth={360}
+            />
+          </View>
+        ) : null}
+      </View>
+      {saveError ? (
+        <View style={styles.calloutWrap}>
+          <Alert
+            size="sm"
+            testID="project-default-model-error"
+            variant="error"
+            title={t("settings.project.defaultModel.saveError")}
+            description={saveError}
+          />
+        </View>
+      ) : null}
+    </SettingsSection>
+  );
 }
 
 function ProjectTitleIcon({

@@ -3161,6 +3161,19 @@ export const fr: TranslationResources = {
     project: {
       noEditableTarget: "Ce projet n’est pas modifiable sur cet hôte.",
       backToProjects: "Retour aux projets",
+      defaultModel: {
+        title: "Modèle par défaut",
+        info: "Fournisseur et modèle utilisés par défaut lors de la création de nouveaux espaces de travail ou onglets d’agent dans ce projet",
+        selection: "Sélection du modèle",
+        global: "Défaut global",
+        custom: "Personnalisé",
+        globalHint: "Utiliser le dernier modèle utilisé globalement",
+        customHint: "Toujours démarrer les nouveaux agents de ce projet avec le modèle sélectionné",
+        model: "Modèle",
+        modelHint: "Fournisseur et modèle utilisés pour les nouveaux agents de ce projet",
+        savedToast: "Modèle par défaut mis à jour",
+        saveError: "Impossible d’enregistrer le modèle par défaut",
+      },
       edit: {
         title: "Modifier le projet",
         name: "Nom",
