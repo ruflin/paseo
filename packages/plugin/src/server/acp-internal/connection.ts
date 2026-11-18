@@ -1,7 +1,10 @@
 import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { spawnProcess, terminateProcess } from "../process.js";
+import { realpathSync } from "node:fs";
+import path from "node:path";
 import { Readable, Writable } from "node:stream";
+import { fileURLToPath } from "node:url";
+import { spawnProcess, terminateProcess } from "../process.js";
 import {
   ClientSideConnection,
   CLIENT_METHODS,
@@ -10,10 +13,13 @@ import {
   type Client,
   type AgentCapabilities,
   type ContentBlock,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type NewSessionResponse,
   type RequestPermissionRequest,
   type RequestPermissionResponse,
   type SessionConfigOption,
+  type SessionInfo,
   type SessionNotification,
   type SessionUpdate,
   type ToolCall,
@@ -30,6 +36,12 @@ import type {
   AcpVendorUpdate,
   RunAcpProviderOptions,
 } from "../acp.js";
+import {
+  buildElicitationResponse,
+  parseElicitationQuestions,
+  toQuestionPermissionInput,
+  type NormalizedElicitationQuestion,
+} from "./elicitation.js";
 import {
   PROVIDER_PROTOCOL_VERSION,
   ProviderEventSchema,
@@ -84,6 +96,9 @@ export async function createAcpProviderConnection(
   const supportedCapabilities: ProviderCapability[] = [...ADAPTER_CAPABILITIES];
   if (probe.agentCapabilities.promptCapabilities?.image) {
     supportedCapabilities.push("prompt.image");
+  }
+  if (options.acpOptions?.steer) {
+    supportedCapabilities.push("prompt.steer");
   }
   if (probe.agentCapabilities.sessionCapabilities?.list) {
     supportedCapabilities.push("session.list");
@@ -279,6 +294,51 @@ async function discover(
   }
 }
 
+const MAX_SESSION_LIST_PAGES = 50;
+
+function decodeSessionCwd(value: string): string {
+  if (value.startsWith("file:")) {
+    try {
+      return fileURLToPath(value);
+    } catch {
+      return value;
+    }
+  }
+  if (!value.includes("%")) return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function normalizeComparablePath(value: string): string {
+  const normalized = path.posix.normalize(value.replaceAll("\\", "/"));
+  return normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized;
+}
+
+function cwdVariants(value: string, cache: Map<string, Set<string>>): Set<string> {
+  const cached = cache.get(value);
+  if (cached) return cached;
+  const candidates = [value];
+  for (const resolve of [realpathSync.native, realpathSync]) {
+    try {
+      candidates.push(resolve(value));
+    } catch {
+      // Unresolvable paths compare by normalized string form.
+    }
+  }
+  const variants = new Set(candidates.map(normalizeComparablePath));
+  cache.set(value, variants);
+  return variants;
+}
+
+function sessionUpdatedAtMs(updatedAt: string | null | undefined): number {
+  if (!updatedAt) return Number.NEGATIVE_INFINITY;
+  const parsed = Date.parse(updatedAt);
+  return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+}
+
 async function listSessions(
   input: Extract<ProviderInput, { type: "sessions" }>,
   state: AcpConnectionState,
@@ -291,26 +351,46 @@ async function listSessions(
     emit: state.emit,
   });
   try {
-    const response = await runtime.listSessions(input.cwd);
+    const allSessions = await runtime.listSessions(input.cwd);
     const needle = input.query?.trim().toLowerCase();
-    const filtered = response.sessions.filter((session) => {
-      if (state.options.acpOptions?.filterSessionsByCwd && input.cwd && session.cwd !== input.cwd) {
-        return false;
+    const variantCache = new Map<string, Set<string>>();
+    const targetVariants =
+      state.options.acpOptions?.filterSessionsByCwd && input.cwd
+        ? cwdVariants(decodeSessionCwd(input.cwd), variantCache)
+        : null;
+    const filtered: Array<SessionInfo & { resolvedCwd: string }> = [];
+    for (const session of allSessions) {
+      const decodedCwd = decodeSessionCwd(session.cwd);
+      let resolvedCwd = decodedCwd;
+      if (targetVariants && input.cwd) {
+        const sessionVariants = cwdVariants(decodedCwd, variantCache);
+        if (![...sessionVariants].some((variant) => targetVariants.has(variant))) {
+          continue;
+        }
+        resolvedCwd = input.cwd;
       }
-      if (!needle) return true;
-      return (
-        session.sessionId.toLowerCase().includes(needle) ||
-        (session.title?.toLowerCase().includes(needle) ?? false) ||
-        session.cwd.toLowerCase().includes(needle)
-      );
+      if (needle) {
+        const matches =
+          session.sessionId.toLowerCase().includes(needle) ||
+          (session.title?.toLowerCase().includes(needle) ?? false) ||
+          resolvedCwd.toLowerCase().includes(needle);
+        if (!matches) continue;
+      }
+      filtered.push({ ...session, resolvedCwd });
+    }
+    const sorted = filtered.toSorted((left, right) => {
+      const rightMs = sessionUpdatedAtMs(right.updatedAt);
+      const leftMs = sessionUpdatedAtMs(left.updatedAt);
+      if (rightMs === leftMs) return 0;
+      return rightMs - leftMs;
     });
-    const selected = input.limit ? filtered.slice(0, input.limit) : filtered;
+    const selected = input.limit ? sorted.slice(0, input.limit) : sorted;
     state.emit({
       type: "sessions",
       requestId: input.requestId,
       sessions: selected.map((session) => ({
         persistence: nativePersistence(session.sessionId),
-        cwd: session.cwd,
+        cwd: session.resolvedCwd,
         title: session.title ?? undefined,
         updatedAt: session.updatedAt ?? undefined,
       })),
@@ -373,6 +453,18 @@ interface StartRuntimeOptions {
   emit(event: ProviderEvent): void;
 }
 
+interface ActiveAcpPrompt {
+  turnId: string;
+  latestToken: number;
+  inFlight: Set<number>;
+  latestOutcome: {
+    state: "completed" | "canceled" | "failed";
+    errorMessage?: string;
+  } | null;
+  settled: Promise<void>;
+  resolveSettled: () => void;
+}
+
 class AcpRuntime {
   readonly connection: ClientSideConnection;
   agentCapabilities: AgentCapabilities = {};
@@ -388,12 +480,21 @@ class AcpRuntime {
     string,
     { request: RequestPermissionRequest; resolve(response: RequestPermissionResponse): void }
   >();
+  private readonly elicitations = new Map<
+    string,
+    {
+      questions: readonly NormalizedElicitationQuestion[];
+      resolve(response: CreateElicitationResponse): void;
+    }
+  >();
   private readonly transformers: readonly AcpTransformer[];
   private configOptions: SessionConfigOption[] = [];
   private modes: NewSessionResponse["modes"] = null;
   private modelsState: AcpModelState | null = null;
   private commandWaiter: (() => void) | null = null;
   private messageSequence = 0;
+  private elicitationSequence = 0;
+  private promptSequence = 0;
   /**
    * Fallback ids for streamed chunks that carry no `messageId`, one per
    * chunk kind. Consecutive chunks of a kind continue the same timeline
@@ -417,7 +518,7 @@ class AcpRuntime {
   private readonly closeConnector: () => Promise<void>;
   private notificationLane: Promise<void> = Promise.resolve();
   private promptLane: Promise<void> = Promise.resolve();
-  private activePrompt: { turnId: string; settled: Promise<void> } | null = null;
+  private activePrompt: ActiveAcpPrompt | null = null;
   private lastUsage: ProviderUsage = {};
   private stderr = "";
 
@@ -462,7 +563,10 @@ class AcpRuntime {
         runtime.call(
           runtime.connection.initialize({
             protocolVersion: PROTOCOL_VERSION,
-            clientCapabilities: clientCapabilityMeta ? { _meta: clientCapabilityMeta } : {},
+            clientCapabilities: {
+              elicitation: { form: {} },
+              ...(clientCapabilityMeta ? { _meta: clientCapabilityMeta } : {}),
+            },
             clientInfo: { name: "paseo", version: "1" },
           }),
         ),
@@ -492,6 +596,7 @@ class AcpRuntime {
     this.transformers = options.options.transformers ?? [];
     const client: Client = {
       requestPermission: (request) => this.requestPermission(request),
+      createElicitation: (request) => this.createElicitation(request),
       sessionUpdate: (notification) =>
         this.enqueueNotification(() => this.sessionUpdate(notification)),
     };
@@ -724,27 +829,42 @@ class AcpRuntime {
   private async admitPrompt(
     input: Extract<ProviderInput, { type: "session.prompt" }>,
   ): Promise<void> {
+    const prompt = toAcpPrompt(input.prompt);
     const active = this.activePrompt;
+    if (input.prompt.delivery === "steer") {
+      if (!active || active.inFlight.size === 0) {
+        this.emit({
+          type: "session.prompt_result",
+          sessionId: this.options.boundarySessionId,
+          clientMessageId: input.prompt.clientMessageId,
+          result: { type: "completed" },
+        });
+        return;
+      }
+      if (input.prompt.clearPendingPermissions) {
+        this.clearPendingPermissions();
+      }
+      const token = ++this.promptSequence;
+      active.latestToken = token;
+      active.inFlight.add(token);
+      this.emitUserMessage(input.prompt.clientMessageId, prompt);
+      this.emit({
+        type: "session.prompt_result",
+        sessionId: this.options.boundarySessionId,
+        clientMessageId: input.prompt.clientMessageId,
+        result: { type: "steer", turnId: active.turnId },
+      });
+      void this.runPromptCall(active, token, prompt);
+      return;
+    }
+
     if (active) {
       await this.interrupt();
       await active.settled;
     }
-    const prompt = toAcpPrompt(input.prompt);
     const turnId = `acp:${input.prompt.clientMessageId}`;
     this.fallbackChunkIds.clear();
-    this.emit({
-      type: "timeline.item",
-      sessionId: this.options.boundarySessionId,
-      item: {
-        type: "user_message",
-        id: input.prompt.clientMessageId,
-        text: prompt
-          .filter((part) => part.type === "text")
-          .map((part) => part.text)
-          .join("\n"),
-        clientMessageId: input.prompt.clientMessageId,
-      },
-    });
+    this.emitUserMessage(input.prompt.clientMessageId, prompt);
     this.emit({
       type: "session.prompt_result",
       sessionId: this.options.boundarySessionId,
@@ -757,64 +877,115 @@ class AcpRuntime {
       turnId,
       state: "started",
     });
+
+    const token = ++this.promptSequence;
+    let resolveSettled = () => {};
+    const settled = new Promise<void>((resolve) => {
+      resolveSettled = resolve;
+    });
+    const nextActive: ActiveAcpPrompt = {
+      turnId,
+      latestToken: token,
+      inFlight: new Set([token]),
+      latestOutcome: null,
+      settled,
+      resolveSettled,
+    };
+    this.activePrompt = nextActive;
+    void this.runPromptCall(nextActive, token, prompt);
+  }
+
+  private emitUserMessage(clientMessageId: string, prompt: ContentBlock[]): void {
+    this.emit({
+      type: "timeline.item",
+      sessionId: this.options.boundarySessionId,
+      item: {
+        type: "user_message",
+        id: clientMessageId,
+        text: prompt
+          .filter((part): part is Extract<ContentBlock, { type: "text" }> => part.type === "text")
+          .map((part) => part.text)
+          .join("\n"),
+        clientMessageId,
+      },
+    });
+  }
+
+  private async runPromptCall(
+    active: ActiveAcpPrompt,
+    token: number,
+    prompt: ContentBlock[],
+  ): Promise<void> {
     // The SDK dispatches notifications without awaiting them, so the prompt response can resolve
     // while earlier session updates are still queued. Apply them before the turn ends.
-    const settled = this.call(
-      this.connection.prompt({ sessionId: this.nativeSessionId, prompt }),
-    ).then(
-      async (response): Promise<void> => {
+    try {
+      const response = await this.call(
+        this.connection.prompt({ sessionId: this.nativeSessionId, prompt }),
+      );
+      if (response.usage) {
+        this.lastUsage = {
+          ...this.lastUsage,
+          inputTokens: response.usage.inputTokens,
+          outputTokens: response.usage.outputTokens,
+          cachedInputTokens: response.usage.cachedReadTokens ?? undefined,
+        };
+        this.emit({
+          type: "session.usage",
+          sessionId: this.options.boundarySessionId,
+          turnId: active.turnId,
+          usage: this.lastUsage,
+        });
+      }
+      if (token === active.latestToken) {
+        active.latestOutcome = {
+          state: response.stopReason === "cancelled" ? "canceled" : "completed",
+        };
+      }
+    } catch (error) {
+      if (token === active.latestToken) {
+        active.latestOutcome = { state: "failed", errorMessage: this.formatError(error) };
+      }
+    } finally {
+      active.inFlight.delete(token);
+      if (active.inFlight.size === 0) {
         await this.drainNotifications();
-        if (response.usage) {
-          this.lastUsage = {
-            ...this.lastUsage,
-            inputTokens: response.usage.inputTokens,
-            outputTokens: response.usage.outputTokens,
-            cachedInputTokens: response.usage.cachedReadTokens ?? undefined,
-          };
-          this.emit({
-            type: "session.usage",
-            sessionId: this.options.boundarySessionId,
-            turnId,
-            usage: this.lastUsage,
-          });
-        }
-        const state = response.stopReason === "cancelled" ? "canceled" : "completed";
+        const outcome = active.latestOutcome ?? { state: "completed" as const };
         this.fallbackChunkIds.clear();
-        this.terminalizeTransientItems(state);
+        this.terminalizeTransientItems(outcome.state);
         this.emit({
           type: "session.turn",
           sessionId: this.options.boundarySessionId,
-          turnId,
-          state,
+          turnId: active.turnId,
+          state: outcome.state,
+          ...(outcome.state === "failed" && outcome.errorMessage
+            ? { error: { message: outcome.errorMessage } }
+            : {}),
         });
-        return undefined;
-      },
-      async (error): Promise<void> => {
-        await this.drainNotifications();
-        this.fallbackChunkIds.clear();
-        this.terminalizeTransientItems("failed");
-        this.emit({
-          type: "session.turn",
-          sessionId: this.options.boundarySessionId,
-          turnId,
-          state: "failed",
-          error: { message: this.formatError(error) },
-        });
-        return undefined;
-      },
-    );
-    this.activePrompt = { turnId, settled };
-    void settled.finally(() => {
-      if (this.activePrompt?.turnId === turnId) this.activePrompt = null;
-    });
+        if (this.activePrompt === active) this.activePrompt = null;
+        active.resolveSettled();
+      }
+    }
   }
 
   interrupt(): Promise<void> {
     return this.call(this.connection.cancel({ sessionId: this.nativeSessionId }));
   }
 
-  listSessions(cwd?: string) {
-    return this.call(this.connection.listSessions({ cwd }));
+  async listSessions(cwd?: string): Promise<SessionInfo[]> {
+    const sessions: SessionInfo[] = [];
+    let cursor: string | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_SESSION_LIST_PAGES; pageIndex += 1) {
+      const page = await this.call(
+        this.connection.listSessions({
+          ...(cwd ? { cwd } : {}),
+          ...(cursor ? { cursor } : {}),
+        }),
+      );
+      sessions.push(...page.sessions);
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    return sessions;
   }
 
   async drainNotifications(): Promise<void> {
@@ -826,6 +997,17 @@ class AcpRuntime {
     permissionId: string,
     response: Extract<ProviderInput, { type: "session.permission" }>["response"],
   ): void {
+    const pendingElicitation = this.elicitations.get(permissionId);
+    if (pendingElicitation) {
+      this.elicitations.delete(permissionId);
+      pendingElicitation.resolve(buildElicitationResponse(pendingElicitation.questions, response));
+      this.emit({
+        type: "session.permission_resolved",
+        sessionId: this.options.boundarySessionId,
+        permissionId,
+      });
+      return;
+    }
     const pending = this.permissions.get(permissionId);
     if (!pending) throw new Error(`Unknown ACP permission: ${permissionId}`);
     const selected = selectPermissionOption(pending.request.options, response);
@@ -1073,6 +1255,28 @@ class AcpRuntime {
         }),
       );
     }
+  }
+
+  private createElicitation(request: CreateElicitationRequest): Promise<CreateElicitationResponse> {
+    const questions = parseElicitationQuestions(request);
+    if (!questions) {
+      return Promise.resolve({ action: "decline" });
+    }
+    const permissionId = `elicitation:${++this.elicitationSequence}`;
+    return new Promise((resolve) => {
+      this.elicitations.set(permissionId, { questions, resolve });
+      this.emit({
+        type: "session.permission",
+        sessionId: this.options.boundarySessionId,
+        request: {
+          id: permissionId,
+          name: "AskUserQuestion",
+          kind: "question",
+          title: request.message,
+          input: toQuestionPermissionInput(questions),
+        },
+      });
+    });
   }
 
   private requestPermission(request: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -1397,11 +1601,36 @@ class AcpRuntime {
     });
   }
 
+  private clearPendingPermissions(): void {
+    for (const [permissionId, permission] of this.permissions) {
+      permission.resolve({ outcome: { outcome: "cancelled" } });
+      this.emit({
+        type: "session.permission_resolved",
+        sessionId: this.options.boundarySessionId,
+        permissionId,
+      });
+    }
+    this.permissions.clear();
+    for (const [permissionId, elicitation] of this.elicitations) {
+      elicitation.resolve({ action: "cancel" });
+      this.emit({
+        type: "session.permission_resolved",
+        sessionId: this.options.boundarySessionId,
+        permissionId,
+      });
+    }
+    this.elicitations.clear();
+  }
+
   private settlePendingWork(): void {
     for (const permission of this.permissions.values()) {
       permission.resolve({ outcome: { outcome: "cancelled" } });
     }
     this.permissions.clear();
+    for (const elicitation of this.elicitations.values()) {
+      elicitation.resolve({ action: "cancel" });
+    }
+    this.elicitations.clear();
     this.commandWaiter?.();
     this.commandWaiter = null;
   }

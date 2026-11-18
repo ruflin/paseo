@@ -15,6 +15,55 @@ if (args.includes("--version")) {
   process.exit(0);
 }
 
+if (args.includes("-p") && args.includes("/usage")) {
+  if (process.env.AGY_TEST_USAGE === "auth") {
+    process.stderr.write("Authentication required\n");
+    process.exit(1);
+  }
+  process.stdout.write(
+    JSON.stringify({
+      command: {
+        data: {
+          groups: [
+            {
+              name: "Gemini Models",
+              buckets: [
+                {
+                  id: "gemini-5h",
+                  name: "Five Hour Limit",
+                  window: "5h",
+                  remaining_fraction: 0.75,
+                  reset_time: "2026-11-18T22:00:00Z",
+                },
+                {
+                  id: "gemini-weekly",
+                  name: "Weekly Limit",
+                  window: "weekly",
+                  remaining_fraction: 0.5,
+                  reset_time: "2026-11-25T00:00:00Z",
+                },
+              ],
+            },
+            {
+              name: "Claude and GPT models",
+              buckets: [
+                {
+                  id: "claude-5h",
+                  name: "Five Hour Limit",
+                  window: "5h",
+                  remaining_fraction: 0.8,
+                  reset_time: "2026-11-18T22:00:00Z",
+                },
+              ],
+            },
+          ],
+        },
+      },
+    }),
+  );
+  process.exit(0);
+}
+
 if (process.env.AGY_TEST_STARTUP === "exit") {
   process.exit(3);
 }
@@ -22,6 +71,7 @@ if (process.env.AGY_TEST_STARTUP === "exit") {
 let nextRequestId = 1;
 const pendingOutgoing = new Map();
 let activeCancel = null;
+let activeSteerResolve = null;
 let currentModel = "gemini-4-argon";
 let currentThinking = "medium";
 let currentMode = "default";
@@ -121,6 +171,77 @@ async function handlePrompt(id, params) {
 
   if (text.includes("AUTH_ERR")) {
     send({ jsonrpc: "2.0", id, error: { code: -32000, message: "Authentication required" } });
+    return;
+  }
+
+  if (text.includes("STEER_WAIT")) {
+    updateSession({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: "Started turn." },
+    });
+    const steerResult = await new Promise((resolve) => {
+      activeSteerResolve = resolve;
+      activeCancel = () => resolve({ cancelled: true });
+    });
+    activeSteerResolve = null;
+    activeCancel = null;
+    send({
+      jsonrpc: "2.0",
+      id,
+      result: { stopReason: steerResult?.cancelled ? "cancelled" : "end_turn" },
+    });
+    return;
+  }
+
+  if (activeSteerResolve) {
+    activeSteerResolve({ cancelled: false });
+    updateSession({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: `Steered: ${text}` },
+    });
+    send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
+    return;
+  }
+
+  if (text.includes("QUESTION")) {
+    const reply = await sendRequest("elicitation/create", {
+      sessionId: currentSessionId,
+      mode: "form",
+      message: "Answer the questions",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          q1: {
+            type: "string",
+            title: "Choose color",
+            oneOf: [
+              { const: "red", title: "Red" },
+              { const: "blue", title: "Blue" },
+            ],
+          },
+          q1_other: {
+            type: "string",
+            title: "Other",
+            description: "Optional free-form answer to: Choose color",
+          },
+          q2: {
+            type: "array",
+            title: "Pick flags",
+            items: {
+              anyOf: [
+                { const: "fast", title: "Fast" },
+                { const: "safe", title: "Safe" },
+              ],
+            },
+          },
+        },
+      },
+    });
+    updateSession({
+      sessionUpdate: "agent_message_chunk",
+      content: { type: "text", text: `Elicitation:${JSON.stringify(reply)}` },
+    });
+    send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
     return;
   }
 
@@ -275,6 +396,43 @@ async function handlePrompt(id, params) {
   });
 }
 
+function handleSessionList(id, params) {
+  const cwdA = process.env.AGY_TEST_LIST_CWD_A || "/repo-a";
+  const cwdB = process.env.AGY_TEST_LIST_CWD_B || "/repo-b";
+  const encodedA = process.env.AGY_TEST_LIST_FILE_URI ? `file://${encodeURI(cwdA)}` : cwdA;
+  const pageOne = [
+    {
+      sessionId: "sess-a",
+      cwd: encodedA,
+      title: "Alpha task",
+      updatedAt: "2026-11-14T10:00:00.000Z",
+    },
+    {
+      sessionId: "sess-b",
+      cwd: cwdB,
+      title: "Beta task",
+      updatedAt: "2026-11-14T11:00:00.000Z",
+    },
+  ];
+  const pageTwo = [
+    {
+      sessionId: "sess-a2",
+      cwd: encodedA,
+      title: "Second repo A",
+      updatedAt: "2026-11-14T12:00:00.000Z",
+    },
+  ];
+  if (process.env.AGY_TEST_LIST_PAGINATED) {
+    const result =
+      params?.cursor === "page-2"
+        ? { sessions: pageTwo }
+        : { sessions: pageOne, nextCursor: "page-2" };
+    send({ jsonrpc: "2.0", id, result });
+    return;
+  }
+  send({ jsonrpc: "2.0", id, result: { sessions: [...pageOne, ...pageTwo] } });
+}
+
 async function handleRequest(msg) {
   const { id, method, params } = msg;
   record({ method, params });
@@ -369,34 +527,7 @@ async function handleRequest(msg) {
   }
 
   if (method === "session/list") {
-    const cwdA = process.env.AGY_TEST_LIST_CWD_A || "/repo-a";
-    const cwdB = process.env.AGY_TEST_LIST_CWD_B || "/repo-b";
-    send({
-      jsonrpc: "2.0",
-      id,
-      result: {
-        sessions: [
-          {
-            sessionId: "sess-a",
-            cwd: cwdA,
-            title: "Alpha task",
-            updatedAt: "2026-11-14T10:00:00.000Z",
-          },
-          {
-            sessionId: "sess-b",
-            cwd: cwdB,
-            title: "Beta task",
-            updatedAt: "2026-11-14T11:00:00.000Z",
-          },
-          {
-            sessionId: "sess-a2",
-            cwd: cwdA,
-            title: "Second repo A",
-            updatedAt: "2026-11-14T12:00:00.000Z",
-          },
-        ],
-      },
-    });
+    handleSessionList(id, params);
     return;
   }
 

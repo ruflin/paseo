@@ -12,7 +12,7 @@ nav: Antigravity
 
 在 daemon 主机上安装 Antigravity CLI（`agy` `1.5.0` 或更高版本），然后运行一次 `agy` 登录。在 Paseo 中选择 **Antigravity**。该 Provider 随 Paseo 一起提供，无需另外安装插件。
 
-Paseo 通过 `agy acp` 连接，支持按模型配置思考级别、斜杠命令、Paseo MCP 工具、内联图片附件、会话列表以及恢复会话时的历史重放。
+Paseo 通过 `agy acp` 连接，支持按模型配置思考级别、斜杠命令、回合中引导（steering）、交互式提问卡片、Paseo MCP 工具、内联图片附件、会话列表、恢复会话时的历史重放，以及在「使用情况」面板中查看额度。
 
 如果 `agy` 不在 daemon 的 PATH 中，请在 `~/.paseo/config.json` 中覆盖它的命令。启动 ACP 模式时请保留 `"acp"` 参数，并使用 `env` 设置 Provider 专用的环境变量：
 
@@ -37,4 +37,4 @@ Antigravity 支持 `default`、`accept-edits`、`auto` 和 `plan` 权限模式�
 
 ## 限制 {#limitations}
 
-- 在回合进行中发送消息会先取消当前回合，再发送新的提示词。
+- 启用 Paseo MCP 工具时，会指示 Antigravity 通过 Paseo 的 `create_agent` 工具创建子 Agent，以便在 Paseo 中查看和控制子 Agent。

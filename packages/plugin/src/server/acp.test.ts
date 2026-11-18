@@ -7,7 +7,12 @@ import {
   type Agent,
   type SessionUpdate,
 } from "@agentclientprotocol/sdk";
-import type { ProviderConnection, ProviderEvent, ProviderInput } from "./provider.js";
+import {
+  PROVIDER_CAPABILITIES,
+  type ProviderConnection,
+  type ProviderEvent,
+  type ProviderInput,
+} from "./provider.js";
 import { afterEach, describe, expect, it } from "vitest";
 import { AgentTimelineItemPayloadSchema } from "@getpaseo/protocol/messages";
 import { runAcpProvider, type AcpStreamMessage } from "./acp.js";
@@ -2496,6 +2501,337 @@ lines.on("line", (line) => {
             type: "tool_call",
             detail: { type: "sub_agent", subAgentType: "research", log: "" },
             metadata: { rawMeta: { subagent: { role: "researcher" } } },
+          }),
+        }),
+      );
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("paginates session/list, decodes file URIs, and sorts newest first before applying limit", async () => {
+    const harness = connectorHarness({
+      capabilities: { sessionCapabilities: { list: {} } },
+      handleRequest(instance, request) {
+        if (request.method !== "session/list") return false;
+        const cursor = (request.params as { cursor?: string } | undefined)?.cursor;
+        if (!cursor) {
+          instance.respond(request, {
+            sessions: [
+              {
+                sessionId: "older-a",
+                cwd: "file:///tmp/my%20repo",
+                title: "Older",
+                updatedAt: "2026-11-10T10:00:00.000Z",
+              },
+              {
+                sessionId: "other-b",
+                cwd: "/tmp/other-repo",
+                title: "Other",
+                updatedAt: "2026-11-15T10:00:00.000Z",
+              },
+            ],
+            nextCursor: "page-2",
+          });
+          return true;
+        }
+        instance.respond(request, {
+          sessions: [
+            {
+              sessionId: "newest-a",
+              cwd: "/tmp/my repo/",
+              title: "Newest",
+              updatedAt: "2026-11-16T10:00:00.000Z",
+            },
+          ],
+        });
+        return true;
+      },
+    });
+    const registration = runAcpProvider({
+      id: "list-acp",
+      label: "List ACP",
+      connector: harness.connector,
+      acpOptions: { filterSessionsByCwd: true },
+    });
+    const connection = await registration.connect({
+      versions: [1],
+      capabilities: [...PROVIDER_CAPABILITIES],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+
+    try {
+      await connection.send({
+        type: "sessions",
+        requestId: "list-paginated",
+        cwd: "/tmp/my repo",
+        limit: 1,
+      });
+      const event = (await waitForEvent(
+        events,
+        (e) => e.type === "sessions" && e.requestId === "list-paginated",
+      )) as Extract<ProviderEvent, { type: "sessions" }>;
+      expect(event.sessions).toEqual([
+        {
+          persistence: { version: 1, data: { sessionId: "newest-a" } },
+          cwd: "/tmp/my repo",
+          title: "Newest",
+          updatedAt: "2026-11-16T10:00:00.000Z",
+        },
+      ]);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("maps ACP elicitation/create requests to question permissions and responses", async () => {
+    let seenCapability: unknown = null;
+    let elicitationResult: unknown = null;
+    const harness = connectorHarness({
+      handleRequest(instance, request) {
+        if (request.method === "initialize") {
+          seenCapability = (request.params as { clientCapabilities?: { elicitation?: unknown } })
+            ?.clientCapabilities?.elicitation;
+          return false;
+        }
+        if (request.method !== "session/prompt") return false;
+        const promptBlocks = (request.params as { prompt: Array<{ text?: string }> }).prompt;
+        const text = promptBlocks[0]?.text ?? "";
+        void (async () => {
+          elicitationResult = await instance.request("elicitation/create", {
+            sessionId: "native-1",
+            mode: "form",
+            message: "Project setup",
+            requestedSchema: {
+              type: "object",
+              properties: {
+                q1: {
+                  type: "string",
+                  title: "Runtime",
+                  oneOf: [
+                    { const: "node", title: "Node.js" },
+                    { const: "deno", title: "Deno" },
+                  ],
+                },
+                q1_other: { type: "string", title: "Other" },
+                q2: {
+                  type: "array",
+                  title: "Features",
+                  items: {
+                    anyOf: [
+                      { const: "lint", title: "Linter" },
+                      { const: "test", title: "Tests" },
+                    ],
+                  },
+                },
+                q2_other: { type: "string", title: "Other" },
+              },
+            },
+          });
+          instance.respond(request, { stopReason: text === "decline" ? "cancelled" : "end_turn" });
+        })();
+        return true;
+      },
+    });
+    const registration = runAcpProvider({
+      id: "elicit-acp",
+      label: "Elicit ACP",
+      connector: harness.connector,
+    });
+    const connection = await registration.connect({
+      versions: [1],
+      capabilities: [...PROVIDER_CAPABILITIES],
+    });
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+
+    try {
+      await connection.send(openInput());
+      await waitForEvent(events, (e) => e.type === "session.ready");
+      expect(seenCapability).toEqual({ form: {} });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "session-1",
+        prompt: {
+          clientMessageId: "m-ask",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "ask" }] },
+        },
+      });
+      const permission = (await waitForEvent(
+        events,
+        (e) => e.type === "session.permission",
+      )) as Extract<ProviderEvent, { type: "session.permission" }>;
+      expect(permission.request).toMatchObject({
+        name: "AskUserQuestion",
+        kind: "question",
+        title: "Project setup",
+        input: {
+          questions: [
+            {
+              header: "Question 1",
+              question: "Runtime",
+              multiSelect: false,
+              allowOther: true,
+              options: [{ label: "Node.js" }, { label: "Deno" }],
+            },
+            {
+              header: "Question 2",
+              question: "Features",
+              multiSelect: true,
+              allowOther: true,
+              options: [{ label: "Linter" }, { label: "Tests" }],
+            },
+          ],
+        },
+      });
+
+      await connection.send({
+        type: "session.permission",
+        sessionId: "session-1",
+        permissionId: permission.request.id,
+        response: {
+          behavior: "allow",
+          updatedInput: {
+            answers: {
+              "Question 1": "Bun",
+              "Question 2": "Linter, custom-flag",
+            },
+          },
+        },
+      });
+      await waitForEvent(
+        events,
+        (e) => e.type === "session.turn" && e.turnId === "acp:m-ask" && e.state === "completed",
+      );
+      expect(elicitationResult).toEqual({
+        action: "accept",
+        content: {
+          q1_other: "Bun",
+          q2: ["lint"],
+          q2_other: "custom-flag",
+        },
+      });
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("supports mid-turn steering when acpOptions.steer is enabled", async () => {
+    let firstPromptRequest: AcpRequestMessage | null = null;
+    const harness = connectorHarness({
+      handleRequest(instance, request) {
+        if (request.method !== "session/prompt") return false;
+        const promptBlocks = (request.params as { prompt: Array<{ text?: string }> }).prompt;
+        const text = promptBlocks[0]?.text ?? "";
+        if (text === "first") {
+          firstPromptRequest = request;
+          instance.notify("session/update", {
+            sessionId: "connector-session",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "One " },
+            },
+          });
+          return true;
+        }
+        if (firstPromptRequest) {
+          instance.respond(firstPromptRequest, { stopReason: "end_turn" });
+          firstPromptRequest = null;
+        }
+        instance.notify("session/update", {
+          sessionId: "connector-session",
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: `Two:${text}` },
+          },
+        });
+        instance.respond(request, { stopReason: "end_turn" });
+        return true;
+      },
+    });
+    const registration = runAcpProvider({
+      id: "steer-acp",
+      label: "Steer ACP",
+      connector: harness.connector,
+      acpOptions: { steer: true },
+    });
+    const connection = await registration.connect({
+      versions: [1],
+      capabilities: [...PROVIDER_CAPABILITIES],
+    });
+    expect(connection.capabilities).toContain("prompt.steer");
+    const events: ProviderEvent[] = [];
+    connection.onEvent((event) => events.push(event));
+
+    try {
+      await connection.send(openInput());
+      await waitForEvent(events, (e) => e.type === "session.ready");
+
+      // Steering with no active turn returns completed so the daemon can queue normally.
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "session-1",
+        prompt: {
+          clientMessageId: "m-idle",
+          delivery: "steer",
+          input: { type: "message", content: [{ type: "text", text: "idle" }] },
+        },
+      });
+      const idleResult = (await waitForEvent(
+        events,
+        (e) => e.type === "session.prompt_result" && e.clientMessageId === "m-idle",
+      )) as Extract<ProviderEvent, { type: "session.prompt_result" }>;
+      expect(idleResult.result).toEqual({ type: "completed" });
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "session-1",
+        prompt: {
+          clientMessageId: "m-1",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "first" }] },
+        },
+      });
+      await waitForEvent(
+        events,
+        (e) =>
+          e.type === "timeline.item" &&
+          e.item.type === "assistant_message" &&
+          e.item.text.includes("One "),
+      );
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "session-1",
+        prompt: {
+          clientMessageId: "m-steer",
+          delivery: "steer",
+          input: { type: "message", content: [{ type: "text", text: "redirect" }] },
+        },
+      });
+      const steerResult = (await waitForEvent(
+        events,
+        (e) => e.type === "session.prompt_result" && e.clientMessageId === "m-steer",
+      )) as Extract<ProviderEvent, { type: "session.prompt_result" }>;
+      expect(steerResult.result).toEqual({ type: "steer", turnId: "acp:m-1" });
+
+      await waitForEvent(
+        events,
+        (e) => e.type === "session.turn" && e.turnId === "acp:m-1" && e.state === "completed",
+      );
+      const completedTurns = events.filter(
+        (e) => e.type === "session.turn" && e.turnId === "acp:m-1" && e.state === "completed",
+      );
+      expect(completedTurns).toHaveLength(1);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline.item",
+          item: expect.objectContaining({
+            type: "assistant_message",
+            text: "One Two:redirect",
           }),
         }),
       );

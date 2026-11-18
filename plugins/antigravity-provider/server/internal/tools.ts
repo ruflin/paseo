@@ -2,6 +2,13 @@ import type { JsonValue } from "@getpaseo/protocol/agent-types";
 import type { AcpToolCallSnapshot } from "@getpaseo/plugin/server/acp";
 import type { ProviderToolCallDetail } from "@getpaseo/plugin/server/provider";
 
+const MAX_TOOL_OUTPUT_CHARS = 64_000;
+
+function clampOutput(value: string | undefined): string | undefined {
+  if (value === undefined || value.length <= MAX_TOOL_OUTPUT_CHARS) return value;
+  return `${value.slice(0, MAX_TOOL_OUTPUT_CHARS)}\n[truncated]`;
+}
+
 function asRecord(value: JsonValue | undefined): Record<string, JsonValue> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return {};
   return value;
@@ -46,12 +53,14 @@ function shellDetail(
 ): ProviderToolCallDetail {
   const command = firstString(input.CommandLine, input.command, input.cmd, snapshot.title) ?? "";
   const cwd = firstString(input.Cwd, input.cwd);
-  const shellOutput = firstString(
-    output.output,
-    output.stdout,
-    output.Output,
-    contentText,
-    typeof snapshot.output === "string" ? snapshot.output : undefined,
+  const shellOutput = clampOutput(
+    firstString(
+      output.output,
+      output.stdout,
+      output.Output,
+      contentText,
+      typeof snapshot.output === "string" ? snapshot.output : undefined,
+    ),
   );
   const exitCode = firstNumber(output.exitCode, output.exit_code);
   return {
@@ -71,11 +80,13 @@ function readDetail(
 ): ProviderToolCallDetail {
   const filePath =
     firstString(input.Path, input.filePath, input.AbsolutePath, snapshot.locations[0]) ?? "";
-  const content = firstString(
-    output.content,
-    output.text,
-    contentText,
-    typeof snapshot.output === "string" ? snapshot.output : undefined,
+  const content = clampOutput(
+    firstString(
+      output.content,
+      output.text,
+      contentText,
+      typeof snapshot.output === "string" ? snapshot.output : undefined,
+    ),
   );
   const offset = firstNumber(input.StartLine, input.offset);
   const endLine = firstNumber(input.EndLine);
@@ -151,7 +162,7 @@ function searchDetail(
 ): ProviderToolCallDetail {
   const query =
     firstString(input.Query, input.query, input.Pattern, input.pattern, snapshot.title) ?? "";
-  const content = firstString(output.content, contentText);
+  const content = clampOutput(firstString(output.content, contentText));
   return {
     type: "search",
     query,
@@ -225,12 +236,14 @@ function subagentDetail(
     output.childSessionId,
   );
   const log =
-    firstString(
-      primary?.log_uri,
-      output.log,
-      output.output,
-      contentText,
-      typeof snapshot.output === "string" ? snapshot.output : undefined,
+    clampOutput(
+      firstString(
+        primary?.log_uri,
+        output.log,
+        output.output,
+        contentText,
+        typeof snapshot.output === "string" ? snapshot.output : undefined,
+      ),
     ) ?? "";
   return {
     detail: {
@@ -272,7 +285,7 @@ function resolveDetail(
   }
   if (snapshot.kind === "fetch" || toolName === "read_url_content") {
     const url = firstString(input.Url, input.url, snapshot.title) ?? "";
-    const result = firstString(output.content, contentText);
+    const result = clampOutput(firstString(output.content, contentText));
     return { detail: { type: "fetch", url, ...(result !== undefined ? { result } : {}) } };
   }
   return {};

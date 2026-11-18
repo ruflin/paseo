@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
 } from "@getpaseo/plugin/server/provider";
 import { afterEach, describe, expect, it } from "vitest";
 import { antigravityToolTransformer } from "./internal/tools.js";
+import { AntigravityUsage, parseAgyUsageOutput } from "./internal/usage.js";
 import { createAntigravityProvider } from "./provider.js";
 
 const FAKE_AGY = new URL("../test/agy.mjs", import.meta.url).pathname;
@@ -196,7 +197,33 @@ describe("antigravity-provider (runAcpProvider)", () => {
       );
       expect(
         ev.sessions.map((s) => (s.persistence.data as { sessionId: string }).sessionId),
-      ).toEqual(["sess-a", "sess-a2"]);
+      ).toEqual(["sess-a2", "sess-a"]);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("paginates and decodes file:// URIs in session/list", async () => {
+    const cwdA = tempDir("paseo-agy-uri test-");
+    const cwdB = tempDir();
+    const { connection, events } = await openHarness({
+      AGY_TEST_LIST_CWD_A: cwdA,
+      AGY_TEST_LIST_CWD_B: cwdB,
+      AGY_TEST_LIST_FILE_URI: "1",
+      AGY_TEST_LIST_PAGINATED: "1",
+    });
+    try {
+      await connection.send({ type: "sessions", requestId: "list-paginated", cwd: cwdA, limit: 1 });
+      const ev = await waitFor(
+        events,
+        (e): e is Extract<ProviderEvent, { type: "sessions" }> =>
+          e.type === "sessions" && e.requestId === "list-paginated",
+        "list-paginated",
+      );
+      expect(
+        ev.sessions.map((s) => (s.persistence.data as { sessionId: string }).sessionId),
+      ).toEqual(["sess-a2"]);
+      expect(ev.sessions[0]?.cwd).toBe(cwdA);
     } finally {
       await connection.close();
     }
@@ -242,11 +269,15 @@ describe("antigravity-provider (runAcpProvider)", () => {
 
       const log = readLog(logPath);
       const newCall = log.find((entry) => entry.method === "session/new") as
-        | { params: { _meta?: Record<string, unknown>; mcpServers?: unknown } }
+        | {
+            params: {
+              _meta?: { antigravity?: { systemPrompt?: { append?: string } } };
+              mcpServers?: unknown;
+            };
+          }
         | undefined;
-      expect(newCall?.params._meta).toMatchObject({
-        antigravity: { systemPrompt: { append: "Be concise." } },
-      });
+      expect(newCall?.params._meta?.antigravity?.systemPrompt?.append).toContain("Be concise.");
+      expect(newCall?.params._meta?.antigravity?.systemPrompt?.append).toContain("create_agent");
 
       await connection.send({
         type: "session.prompt",
@@ -380,5 +411,188 @@ describe("antigravity-provider (runAcpProvider)", () => {
     } finally {
       await connection.close();
     }
+  });
+
+  it("supports mid-turn steering and interactive elicitation questions", async () => {
+    const cwd = tempDir();
+    const { connection, events } = await openHarness();
+    expect(connection.capabilities).toContain("prompt.steer");
+    try {
+      await connection.send({
+        type: "session.open",
+        requestId: "open-steer",
+        sessionId: "s-steer",
+        history: "skip",
+        config: { cwd, env: {}, mcpServers: {}, settings: {}, persist: true },
+      });
+      await waitFor(
+        events,
+        (e): e is Extract<ProviderEvent, { type: "session.ready" }> =>
+          e.type === "session.ready" && e.sessionId === "s-steer",
+        "open-steer",
+      );
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s-steer",
+        prompt: {
+          clientMessageId: "m-base",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "STEER_WAIT" }] },
+        },
+      });
+      await waitFor(
+        events,
+        (e): e is Extract<ProviderEvent, { type: "timeline.item" }> =>
+          e.type === "timeline.item" &&
+          e.item.type === "assistant_message" &&
+          e.item.text.includes("Started turn."),
+      );
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s-steer",
+        prompt: {
+          clientMessageId: "m-steer",
+          delivery: "steer",
+          input: { type: "message", content: [{ type: "text", text: "new direction" }] },
+        },
+      });
+      const steerResult = await waitFor(
+        events,
+        (e): e is Extract<ProviderEvent, { type: "session.prompt_result" }> =>
+          e.type === "session.prompt_result" && e.clientMessageId === "m-steer",
+      );
+      expect(steerResult.result).toEqual({ type: "steer", turnId: "acp:m-base" });
+      await waitFor(
+        events,
+        (e): e is Extract<ProviderEvent, { type: "session.turn" }> =>
+          e.type === "session.turn" && e.turnId === "acp:m-base" && e.state === "completed",
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline.item",
+          item: expect.objectContaining({
+            type: "assistant_message",
+            text: "Steered: new direction",
+          }),
+        }),
+      );
+
+      await connection.send({
+        type: "session.prompt",
+        sessionId: "s-steer",
+        prompt: {
+          clientMessageId: "m-q",
+          delivery: "auto",
+          input: { type: "message", content: [{ type: "text", text: "QUESTION" }] },
+        },
+      });
+      const questionPerm = await waitFor(
+        events,
+        (e): e is Extract<ProviderEvent, { type: "session.permission" }> =>
+          e.type === "session.permission" && e.request.kind === "question",
+      );
+      await connection.send({
+        type: "session.permission",
+        sessionId: "s-steer",
+        permissionId: questionPerm.request.id,
+        response: {
+          behavior: "allow",
+          updatedInput: {
+            answers: {
+              "Question 1": "Blue",
+              "Question 2": "Fast, Safe",
+            },
+          },
+        },
+      });
+      await waitFor(
+        events,
+        (e): e is Extract<ProviderEvent, { type: "session.turn" }> =>
+          e.type === "session.turn" && e.turnId === "acp:m-q" && e.state === "completed",
+      );
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "timeline.item",
+          item: expect.objectContaining({
+            type: "assistant_message",
+            text: expect.stringContaining('"q1":"blue","q2":["fast","safe"]'),
+          }),
+        }),
+      );
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("clamps oversized tool outputs and supports Antigravity usage quota reporting", async () => {
+    const oversized = "x".repeat(70_000);
+    const transformed = antigravityToolTransformer({
+      id: "shell-big",
+      name: "run_command",
+      title: "Big output",
+      status: "completed",
+      input: { CommandLine: "cat big.txt" },
+      output: { output: oversized, exitCode: 0 },
+      locations: [],
+    });
+    expect(transformed.detail?.type).toBe("shell");
+    if (transformed.detail?.type === "shell") {
+      expect(transformed.detail.output?.length).toBeLessThan(70_000);
+      expect(transformed.detail.output?.endsWith("\n[truncated]")).toBe(true);
+    }
+
+    const tsv = parseAgyUsageOutput(
+      [
+        "Gemini Models\tFive Hour Limit Remaining\t80%\t2026-11-18T22:00:00Z",
+        "Gemini Models\tWeekly Limit Remaining\t60%\t2026-11-25T00:00:00Z",
+      ].join("\n"),
+    );
+    expect(tsv).toHaveLength(1);
+    expect(tsv[0]?.buckets[0]).toMatchObject({ window: "5h", remainingFraction: 0.8 });
+
+    const agyHome = tempDir("paseo-agy-home-");
+    mkdirSync(path.join(agyHome, "log"), { recursive: true });
+    writeFileSync(
+      path.join(agyHome, "log", "cli-1.log"),
+      "applyAuthResult: email=dev@example.com, ok\n",
+    );
+
+    let nowMs = 1_000;
+    const usage = new AntigravityUsage({ now: () => nowMs, ttlMs: 60_000 });
+    usage.remember(testLaunch({ AGY_HOME: agyHome }));
+    const reg = usage.registration();
+    const accounts = await reg.discover({
+      kind: "session",
+      provider: "antigravity",
+      env: { AGY_HOME: agyHome },
+    });
+    expect(accounts).toHaveLength(1);
+    expect(accounts[0]?.label).toBe("dev@example.com");
+
+    const report = await reg.fetch(accounts[0]!.input);
+    expect(report).toMatchObject({
+      status: "available",
+      windows: [
+        { id: "gemini_models:five_hour", usedPct: 25, remainingPct: 75, summary: true },
+        { id: "gemini_models:weekly", usedPct: 50, remainingPct: 50 },
+        { id: "claude_and_gpt_models:five_hour", usedPct: 20, remainingPct: 80, summary: true },
+      ],
+    });
+
+    const authAgyHome = tempDir("paseo-agy-auth-");
+    const authUsage = new AntigravityUsage();
+    authUsage.remember(testLaunch({ AGY_HOME: authAgyHome, AGY_TEST_USAGE: "auth" }));
+    const authAccounts = await authUsage.registration().discover({
+      kind: "session",
+      provider: "antigravity",
+      env: { AGY_HOME: authAgyHome },
+    });
+    const authReport = await authUsage.registration().fetch(authAccounts[0]!.input);
+    expect(authReport).toMatchObject({
+      status: "unavailable",
+      problem: { kind: "no_quota" },
+    });
   });
 });

@@ -57,6 +57,8 @@ export interface AcpOptions {
   discoverThinkingPerModel?: boolean;
   /** Additional `_meta` entries advertised under `clientCapabilities` during ACP initialize. */
   clientCapabilityMeta?: Record<string, JsonValue>;
+  /** Enable mid-turn steering (`prompt.steer`) by sending concurrent `session/prompt` requests. */
+  steer?: boolean;
 }
 
 export interface AcpContext {
